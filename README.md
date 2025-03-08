@@ -7,6 +7,8 @@
 
 # OpenMoE with LayerSkip
 OpenMoE is a project aimed at igniting the open-source MoE community! We are releasing a family of open-sourced Mixture-of-Experts (MoE) Large Language Models.
+Note: mirrored from OpenMoE github 
+
 
 ## Proposed Feature: LayerSkip for MoE
 We're excited to propose **LayerSkip for MoE**, a novel technique that aims to enhance our existing Mixture of Experts architecture by dynamically bypassing layers based on input complexity. This project is currently in development as part of our research initiative. The proposed approach offers several potential benefits:
