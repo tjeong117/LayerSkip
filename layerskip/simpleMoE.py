@@ -183,6 +183,28 @@ class SimpleClassifier(nn.Module):
         return logits, layer_exits, confidence_scores, len(self.layers)
 
 
+# Naive model for comparison
+class NaiveClassifier(nn.Module):
+    def __init__(self, input_dim=64, hidden_dim=128, num_layers=2, num_classes=4):
+        super().__init__()
+
+        self.input_layer = nn.Linear(input_dim, hidden_dim)
+
+        # Create layers without MoE or LayerSkip - simple feed-forward
+        layers = []
+        for _ in range(num_layers):
+            layers.append(nn.Linear(hidden_dim, hidden_dim))
+            layers.append(nn.ReLU())
+
+        self.layers = nn.Sequential(*layers)
+        self.classifier = nn.Linear(hidden_dim, num_classes)
+
+    def forward(self, x):
+        x = F.relu(self.input_layer(x))
+        x = self.layers(x)
+        return self.classifier(x)
+
+
 # Generate synthetic classification dataset
 def generate_synthetic_data(num_samples=10000, input_dim=64, num_classes=4):
     """Generate synthetic data for a classification task"""
@@ -233,7 +255,7 @@ def generate_synthetic_data(num_samples=10000, input_dim=64, num_classes=4):
 
 
 # Training function with early exit loss
-def train_model(model, train_loader, val_loader, epochs=5, lr=0.001, aux_loss_weight=0.3):
+def train_model(model, train_loader, val_loader, epochs=5, lr=0.001, aux_loss_weight=0.3, is_naive=False):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
@@ -244,6 +266,7 @@ def train_model(model, train_loader, val_loader, epochs=5, lr=0.001, aux_loss_we
     train_losses = []
     val_accuracies = []
     early_exit_stats = []
+    epoch_times = []  # Record time per epoch
 
     for epoch in range(epochs):
         model.train()
@@ -255,22 +278,27 @@ def train_model(model, train_loader, val_loader, epochs=5, lr=0.001, aux_loss_we
 
             optimizer.zero_grad()
 
-            # Forward pass with auxiliary logits
-            logits, _, _, _, aux_logits = model(data, return_aux_logits=True)
+            # Forward pass
+            if is_naive:
+                logits = model(data)
+                loss = criterion(logits, target)
+            else:
+                # Forward pass with auxiliary logits for MoE model
+                logits, _, _, _, aux_logits = model(data, return_aux_logits=True)
 
-            # Main loss
-            main_loss = criterion(logits, target)
+                # Main loss
+                main_loss = criterion(logits, target)
 
-            # Auxiliary losses
-            aux_losses = [criterion(aux_logit, target) for aux_logit in aux_logits]
+                # Auxiliary losses
+                aux_losses = [criterion(aux_logit, target) for aux_logit in aux_logits]
 
-            # Combine losses with weighting
-            # We weight earlier layers less since they have less information
-            weighted_aux_losses = [aux_loss_weight * (idx + 1) / len(aux_losses) * loss
-                                   for idx, loss in enumerate(aux_losses)]
+                # Combine losses with weighting
+                # We weight earlier layers less since they have less information
+                weighted_aux_losses = [aux_loss_weight * (idx + 1) / len(aux_losses) * loss
+                                       for idx, loss in enumerate(aux_losses)]
 
-            # Total loss
-            loss = main_loss + sum(weighted_aux_losses)
+                # Total loss
+                loss = main_loss + sum(weighted_aux_losses)
 
             loss.backward()
             optimizer.step()
@@ -286,47 +314,61 @@ def train_model(model, train_loader, val_loader, epochs=5, lr=0.001, aux_loss_we
         # Validation
         model.eval()
         correct = 0
-        layer_exits_count = [0] * (len(model.layers) + 1)  # +1 for final layer
+
+        # For non-naive models, we track early exits
+        if not is_naive:
+            layer_exits_count = [0] * (len(model.layers) + 1)  # +1 for final layer
 
         with torch.no_grad():
             for data, target in val_loader:
                 data, target = data.to(device), target.to(device)
 
                 # Forward pass
-                logits, layer_exits, confidences, exit_layer = model(data)
+                if is_naive:
+                    logits = model(data)
+                    pred = logits.argmax(dim=1, keepdim=True)
+                else:
+                    logits, layer_exits, confidences, exit_layer = model(data)
+                    # Count exits per layer
+                    layer_exits_count[exit_layer] += 1
+                    pred = logits.argmax(dim=1, keepdim=True)
 
-                # Count exits per layer
-                layer_exits_count[exit_layer] += 1
-
-                # Get predictions
-                pred = logits.argmax(dim=1, keepdim=True)
                 correct += pred.eq(target.view_as(pred)).sum().item()
 
         accuracy = 100. * correct / len(val_loader.dataset)
         val_accuracies.append(accuracy)
 
-        # Calculate percentage of early exits per layer
-        early_exit_percentages = [count / len(val_loader.dataset) * 100 for count in layer_exits_count]
-        early_exit_stats.append(early_exit_percentages)
+        # Calculate early exit stats if not naive model
+        if not is_naive:
+            early_exit_percentages = [count / len(val_loader.dataset) * 100 for count in layer_exits_count]
+            early_exit_stats.append(early_exit_percentages)
+            print(f'Early exits per layer: {early_exit_percentages}')
 
         epoch_time = time.time() - start_time
+        epoch_times.append(epoch_time)
+
         print(f'Epoch {epoch}: Train Loss: {train_losses[-1]:.4f}, '
               f'Validation Accuracy: {accuracy:.2f}%, Time: {epoch_time:.2f}s')
-        print(f'Early exits per layer: {early_exit_percentages}')
 
-    return train_losses, val_accuracies, early_exit_stats
+    # Calculate average epoch time
+    avg_epoch_time = sum(epoch_times) / len(epoch_times)
+    print(f"Average epoch time: {avg_epoch_time:.2f}s")
+
+    return train_losses, val_accuracies, early_exit_stats, epoch_times, avg_epoch_time
 
 
 # Function to evaluate and visualize results
-def evaluate_model(model, test_loader):
+def evaluate_model(model, test_loader, is_naive=False):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = model.to(device)
     model.eval()
 
     # Regular evaluation
     correct = 0
-    layer_exits_count = [0] * (len(model.layers) + 1)  # +1 for final layer
-    confidence_per_layer = [[] for _ in range(len(model.layers) + 1)]
+
+    if not is_naive:
+        layer_exits_count = [0] * (len(model.layers) + 1)  # +1 for final layer
+        confidence_per_layer = [[] for _ in range(len(model.layers) + 1)]
 
     # Timing
     inference_times = []
@@ -337,20 +379,27 @@ def evaluate_model(model, test_loader):
 
             # Time inference
             start_time = time.time()
-            logits, layer_exits, confidences, exit_layer = model(data)
-            inference_time = time.time() - start_time
-            inference_times.append(inference_time)
+            if is_naive:
+                logits = model(data)
+                inference_time = time.time() - start_time
+                inference_times.append(inference_time)
+                pred = logits.argmax(dim=1, keepdim=True)
+            else:
+                logits, layer_exits, confidences, exit_layer = model(data)
+                inference_time = time.time() - start_time
+                inference_times.append(inference_time)
 
-            # Count exits per layer
-            layer_exits_count[exit_layer] += 1
+                # Count exits per layer
+                layer_exits_count[exit_layer] += 1
 
-            # Store confidence scores
-            for i, conf in enumerate(confidences):
-                if i < exit_layer:
-                    confidence_per_layer[i].append(conf)
+                # Store confidence scores
+                for i, conf in enumerate(confidences):
+                    if i < exit_layer:
+                        confidence_per_layer[i].append(conf)
 
-            # Get predictions
-            pred = logits.argmax(dim=1, keepdim=True)
+                # Get predictions
+                pred = logits.argmax(dim=1, keepdim=True)
+
             correct += pred.eq(target.view_as(pred)).sum().item()
 
     accuracy = 100. * correct / len(test_loader.dataset)
@@ -359,47 +408,50 @@ def evaluate_model(model, test_loader):
     print(f'Test accuracy: {accuracy:.2f}%')
     print(f'Average inference time: {avg_inference_time * 1000:.2f} ms per batch')
 
-    # Calculate percentage of early exits per layer
-    exit_counts = []
-    for i, count in enumerate(layer_exits_count):
-        layer_name = f"Layer {i}" if i < len(model.layers) else "Final"
-        exit_pct = count / len(test_loader.dataset) * 100
-        exit_counts.append((layer_name, exit_pct))
-        print(f'{layer_name}: {exit_pct:.2f}% of samples')
-
-    # Calculate average confidence per layer
-    avg_confidence = []
-    for i, confidences in enumerate(confidence_per_layer):
-        if confidences:
+    if not is_naive:
+        # Calculate percentage of early exits per layer
+        exit_counts = []
+        for i, count in enumerate(layer_exits_count):
             layer_name = f"Layer {i}" if i < len(model.layers) else "Final"
-            avg_conf = sum(confidences) / len(confidences)
-            avg_confidence.append((layer_name, avg_conf))
-            print(f'{layer_name} average confidence: {avg_conf:.4f}')
+            exit_pct = count / len(test_loader.dataset) * 100
+            exit_counts.append((layer_name, exit_pct))
+            print(f'{layer_name}: {exit_pct:.2f}% of samples')
 
-    # Plot early exit distribution
-    plt.figure(figsize=(10, 5))
-    labels, values = zip(*exit_counts)
-    plt.bar(labels, values)
-    plt.title('Early Exit Distribution')
-    plt.ylabel('Percentage of Samples')
-    plt.ylim(0, 100)
-    plt.savefig('early_exit_distribution.png')
+        # Calculate average confidence per layer
+        avg_confidence = []
+        for i, confidences in enumerate(confidence_per_layer):
+            if confidences:
+                layer_name = f"Layer {i}" if i < len(model.layers) else "Final"
+                avg_conf = sum(confidences) / len(confidences)
+                avg_confidence.append((layer_name, avg_conf))
+                print(f'{layer_name} average confidence: {avg_conf:.4f}')
 
-    # Plot average confidence per layer
-    if avg_confidence:
+        # Plot early exit distribution
         plt.figure(figsize=(10, 5))
-        labels, values = zip(*avg_confidence)
+        labels, values = zip(*exit_counts)
         plt.bar(labels, values)
-        plt.title('Average Confidence per Layer')
-        plt.ylabel('Confidence Score')
-        plt.ylim(0, 1)
-        plt.savefig('confidence_per_layer.png')
+        plt.title('Early Exit Distribution')
+        plt.ylabel('Percentage of Samples')
+        plt.ylim(0, 100)
+        plt.savefig('early_exit_distribution.png')
 
-    return accuracy, avg_inference_time, exit_counts, avg_confidence
+        # Plot average confidence per layer
+        if avg_confidence:
+            plt.figure(figsize=(10, 5))
+            labels, values = zip(*avg_confidence)
+            plt.bar(labels, values)
+            plt.title('Average Confidence per Layer')
+            plt.ylabel('Confidence Score')
+            plt.ylim(0, 1)
+            plt.savefig('confidence_per_layer.png')
+
+        return accuracy, avg_inference_time, exit_counts, avg_confidence
+
+    return accuracy, avg_inference_time
 
 
-# Compare with and without LayerSkip
-def compare_layerskip_performance():
+# Compare all models (with LayerSkip, without LayerSkip, and naive)
+def compare_model_performance():
     # Generate synthetic data
     print("Generating synthetic data...")
     train_loader, test_loader, input_dim = generate_synthetic_data(num_samples=10000, input_dim=64)
@@ -416,34 +468,54 @@ def compare_layerskip_performance():
         enable_layer_skip=False
     )
 
-    # Train both models
+    naive_model = NaiveClassifier(
+        input_dim=input_dim,
+        hidden_dim=128,
+        num_layers=2
+    )
+
+    # Train all models
     print("Training model with LayerSkip...")
-    train_losses_skip, val_accuracies_skip, exit_stats_skip = train_model(
+    train_losses_skip, val_accuracies_skip, exit_stats_skip, epoch_times_skip, avg_time_skip = train_model(
         model_with_skip, train_loader, test_loader, epochs=5
     )
 
     print("\nTraining model without LayerSkip...")
-    train_losses_no_skip, val_accuracies_no_skip, _ = train_model(
+    train_losses_no_skip, val_accuracies_no_skip, _, epoch_times_no_skip, avg_time_no_skip = train_model(
         model_without_skip, train_loader, test_loader, epochs=5
     )
 
-    # Evaluate both models
+    print("\nTraining naive model...")
+    train_losses_naive, val_accuracies_naive, _, epoch_times_naive, avg_time_naive = train_model(
+        naive_model, train_loader, test_loader, epochs=5, is_naive=True
+    )
+
+    # Evaluate all models
     print("\nEvaluating model with LayerSkip...")
     accuracy_skip, time_skip, exits_skip, _ = evaluate_model(model_with_skip, test_loader)
 
     print("\nEvaluating model without LayerSkip...")
     accuracy_no_skip, time_no_skip, _, _ = evaluate_model(model_without_skip, test_loader)
 
+    print("\nEvaluating naive model...")
+    accuracy_naive, time_naive = evaluate_model(naive_model, test_loader, is_naive=True)
+
     # Compare results
     print("\nComparison:")
-    print(f"LayerSkip: Accuracy={accuracy_skip:.2f}%, Inference time={time_skip * 1000:.2f}ms")
-    print(f"No LayerSkip: Accuracy={accuracy_no_skip:.2f}%, Inference time={time_no_skip * 1000:.2f}ms")
-    print(f"Speedup: {time_no_skip / time_skip:.2f}x")
+    print(
+        f"LayerSkip: Accuracy={accuracy_skip:.2f}%, Inference time={time_skip * 1000:.2f}ms, Training time/epoch={avg_time_skip:.2f}s")
+    print(
+        f"No LayerSkip: Accuracy={accuracy_no_skip:.2f}%, Inference time={time_no_skip * 1000:.2f}ms, Training time/epoch={avg_time_no_skip:.2f}s")
+    print(
+        f"Naive model: Accuracy={accuracy_naive:.2f}%, Inference time={time_naive * 1000:.2f}ms, Training time/epoch={avg_time_naive:.2f}s")
+    print(f"Inference Speedup vs. Naive: {time_naive / time_skip:.2f}x")
+    print(f"Training Speedup vs. Naive: {avg_time_naive / avg_time_skip:.2f}x")
 
     # Plot training loss comparison
     plt.figure(figsize=(10, 5))
     plt.plot(train_losses_skip, label='With LayerSkip')
     plt.plot(train_losses_no_skip, label='Without LayerSkip')
+    plt.plot(train_losses_naive, label='Naive')
     plt.title('Training Loss Comparison')
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
@@ -454,13 +526,56 @@ def compare_layerskip_performance():
     plt.figure(figsize=(10, 5))
     plt.plot(val_accuracies_skip, label='With LayerSkip')
     plt.plot(val_accuracies_no_skip, label='Without LayerSkip')
+    plt.plot(val_accuracies_naive, label='Naive')
     plt.title('Validation Accuracy Comparison')
     plt.xlabel('Epoch')
     plt.ylabel('Accuracy (%)')
     plt.legend()
     plt.savefig('validation_accuracy_comparison.png')
 
-    return model_with_skip, model_without_skip
+    # Plot training time comparison
+    plt.figure(figsize=(10, 5))
+    epochs = range(5)
+    plt.plot(epochs, epoch_times_skip, marker='o', label='With LayerSkip')
+    plt.plot(epochs, epoch_times_no_skip, marker='s', label='Without LayerSkip')
+    plt.plot(epochs, epoch_times_naive, marker='^', label='Naive')
+    plt.title('Training Time Comparison')
+    plt.xlabel('Epoch')
+    plt.ylabel('Time (seconds)')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig('training_time_comparison.png')
+
+    # Bar chart for average training and inference times
+    plt.figure(figsize=(12, 6))
+    models = ['LayerSkip', 'No LayerSkip', 'Naive']
+    train_times = [avg_time_skip, avg_time_no_skip, avg_time_naive]
+    infer_times = [time_skip * 1000, time_no_skip * 1000, time_naive * 1000]  # Convert to ms
+
+    x = np.arange(len(models))
+    width = 0.35
+
+    fig, ax1 = plt.subplots(figsize=(12, 6))
+    ax2 = ax1.twinx()
+
+    bar1 = ax1.bar(x - width / 2, train_times, width, label='Avg. Training Time (s/epoch)', color='skyblue')
+    bar2 = ax2.bar(x + width / 2, infer_times, width, label='Avg. Inference Time (ms/batch)', color='salmon')
+
+    ax1.set_xlabel('Model Type')
+    ax1.set_ylabel('Training Time (seconds)')
+    ax2.set_ylabel('Inference Time (milliseconds)')
+
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(models)
+
+    ax1.legend(loc='upper left')
+    ax2.legend(loc='upper right')
+
+    plt.title('Training vs Inference Time Comparison')
+    plt.tight_layout()
+    plt.savefig('time_comparison.png')
+
+    return model_with_skip, model_without_skip, naive_model
 
 
 if __name__ == "__main__":
@@ -470,10 +585,11 @@ if __name__ == "__main__":
 
     # Run comparison
     print("Starting model comparison...")
-    model_with_skip, model_without_skip = compare_layerskip_performance()
+    model_with_skip, model_without_skip, naive_model = compare_model_performance()
 
     # Save trained models
     torch.save(model_with_skip.state_dict(), 'model_with_layerskip.pt')
     torch.save(model_without_skip.state_dict(), 'model_without_layerskip.pt')
+    torch.save(naive_model.state_dict(), 'naive_model.pt')
 
     print("Completed! Models saved.")
