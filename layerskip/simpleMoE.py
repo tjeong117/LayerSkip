@@ -279,7 +279,7 @@ class SimpleClassifier(nn.Module):
         return logits, layer_exits, confidence_scores, len(self.layers)
 
 
-# Enhanced training function with expert load balancing
+# Modified train_model function to handle datasets with difficulty levels
 def train_model(model, train_loader, val_loader, epochs=5, lr=0.001, aux_loss_weight=0.3,
                 load_balance_weight=0.1, is_naive=False):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -303,7 +303,13 @@ def train_model(model, train_loader, val_loader, epochs=5, lr=0.001, aux_loss_we
         model.reset_expert_stats()  # Reset expert utilization statistics
 
         start_time = time.time()
-        for batch_idx, (data, target) in enumerate(train_loader):
+        for batch_idx, batch_data in enumerate(train_loader):
+            # Handle both 2-element and 3-element batches
+            if len(batch_data) == 3:
+                data, target, _ = batch_data  # Ignore the difficulty level
+            else:
+                data, target = batch_data
+
             data, target = data.to(device), target.to(device)
 
             optimizer.zero_grad()
@@ -353,7 +359,13 @@ def train_model(model, train_loader, val_loader, epochs=5, lr=0.001, aux_loss_we
             layer_exit_counts[i] = 0
 
         with torch.no_grad():
-            for data, target in val_loader:
+            for batch_data in val_loader:
+                # Handle both 2-element and 3-element batches
+                if len(batch_data) == 3:
+                    data, target, _ = batch_data  # Ignore the difficulty level
+                else:
+                    data, target = batch_data
+
                 data, target = data.to(device), target.to(device)
 
                 if is_naive:
@@ -401,9 +413,8 @@ def train_model(model, train_loader, val_loader, epochs=5, lr=0.001, aux_loss_we
                 print(f"  {layer_name}: {normalized_util}")
 
     return train_losses, val_accuracies, early_exit_stats, epoch_times, sum(epoch_times) / len(epoch_times)
-
-
 # Enhanced evaluation function
+# Enhanced evaluation function with fix for dataset with difficulty levels
 def evaluate_model(model, test_loader, is_naive=False):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = model.to(device)
@@ -420,15 +431,34 @@ def evaluate_model(model, test_loader, is_naive=False):
     start_time = time.time()
 
     with torch.no_grad():
-        for data, target in test_loader:
+        for batch_data in test_loader:
+            # Handle both 2-element and 3-element batches
+            if len(batch_data) == 3:
+                data, target, difficulty = batch_data
+            else:
+                data, target = batch_data
+                difficulty = None
+
             data, target = data.to(device), target.to(device)
 
             if is_naive:
                 outputs = model(data)
                 _, predicted = torch.max(outputs, 1)
             else:
-                outputs, layer_exits, confidence_scores, exit_layer, complexity_scores = model(data,
-                                                                                               return_aux_logits=True)
+                if difficulty is not None:
+                    # If we have difficulty data available
+                    outputs, layer_exits, confidence_scores, exit_layer, complexity_scores = model(data,
+                                                                                                   return_aux_logits=True)
+                else:
+                    # For datasets without difficulty information
+                    try:
+                        outputs, layer_exits, confidence_scores, exit_layer, complexity_scores = model(data,
+                                                                                                       return_aux_logits=True)
+                    except ValueError:
+                        # Fallback if the model doesn't return complexity scores
+                        outputs, layer_exits, confidence_scores, exit_layer = model(data, return_aux_logits=False)
+                        complexity_scores = [0] * len(layer_exits)
+
                 _, predicted = torch.max(outputs, 1)
 
                 # Track where we exited
@@ -477,3 +507,114 @@ def evaluate_model(model, test_loader, is_naive=False):
         return accuracy, inference_time
     else:
         return accuracy, inference_time, layer_exit_counts, early_exit_rate
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class StandardMoELayer(nn.Module):
+    def __init__(self, input_dim, hidden_dim, expert_count=4, top_k=2):
+        super().__init__()
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.expert_count = expert_count
+        self.top_k = top_k
+
+        # Router network
+        self.router = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, expert_count)
+        )
+
+        # Experts - feed-forward networks
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(input_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+                nn.Linear(hidden_dim, input_dim)
+            ) for _ in range(expert_count)
+        ])
+
+        # Layer normalization for stability
+        self.layer_norm = nn.LayerNorm(input_dim)
+
+    def forward(self, x):
+        # Layer normalization
+        residual = x
+        x = self.layer_norm(x)
+
+        # Get router logits and probabilities
+        router_logits = self.router(x)
+        router_probs = F.softmax(router_logits, dim=-1)
+
+        # Get top-k experts
+        vals, indices = torch.topk(router_probs, self.top_k, dim=-1)
+
+        # Normalize the router probabilities
+        vals = vals / vals.sum(dim=-1, keepdim=True)
+
+        # Process through experts
+        batch_size = x.shape[0]
+        combined_output = torch.zeros_like(x)
+
+        # Standard MoE computation
+        for b in range(batch_size):
+            sample_outputs = []
+            for k in range(self.top_k):
+                expert_idx = indices[b, k].item()
+                weight = vals[b, k].item()
+                expert_output = self.experts[expert_idx](x[b].unsqueeze(0))
+                sample_outputs.append(weight * expert_output)
+
+            # Combine expert outputs for this sample
+            combined_sample = torch.sum(torch.stack(sample_outputs, dim=0), dim=0)
+            combined_output[b] = combined_sample.squeeze(0)
+
+        # Residual connection
+        output = residual + combined_output
+        return output
+
+
+class StandardMoEClassifier(nn.Module):
+    def __init__(self, input_dim=64, hidden_dim=128, num_layers=2,
+                 num_classes=4, expert_count=4, top_k=2):
+        super().__init__()
+
+        self.input_layer = nn.Linear(input_dim, hidden_dim)
+
+        # Create a list of standard MoE layers
+        self.layers = nn.ModuleList([
+            StandardMoELayer(
+                input_dim=hidden_dim,
+                hidden_dim=hidden_dim * 2,
+                expert_count=expert_count,
+                top_k=top_k
+            ) for _ in range(num_layers)
+        ])
+
+        # Final classifier
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, num_classes)
+        )
+
+    def forward(self, x):
+        # Initial layer
+        x = F.relu(self.input_layer(x))
+
+        # Process through MoE layers
+        for layer in self.layers:
+            x = layer(x)
+
+        # Final prediction
+        logits = self.classifier(x)
+
+        # Return extra values to match the interface of SimpleClassifier
+        # but these are placeholder values since standard MoE doesn't have early exit
+        dummy_layer_exits = [False] * len(self.layers)
+        dummy_confidence_scores = [0.0] * len(self.layers)
+        exit_layer = len(self.layers)  # No early exit, so we go through all layers
+
+        return logits, dummy_layer_exits, dummy_confidence_scores, exit_layer

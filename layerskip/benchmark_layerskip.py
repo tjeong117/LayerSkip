@@ -175,7 +175,7 @@ def train_and_evaluate(model_with_skip, model_standard, train_loader, val_loader
     return metrics
 
 
-# Function to evaluate models by difficulty level
+# Function to evaluate models by difficulty level - fixed to handle datasets properly
 def evaluate_by_difficulty(model, test_loader, is_naive=False):
     """Evaluate model accuracy separated by difficulty level"""
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -186,14 +186,26 @@ def evaluate_by_difficulty(model, test_loader, is_naive=False):
     total = [0, 0, 0]
 
     with torch.no_grad():
-        for data, target, difficulty in test_loader:
+        for batch_data in test_loader:
+            # Ensure we have difficulty data
+            if len(batch_data) == 3:
+                data, target, difficulty = batch_data
+            else:
+                # If no difficulty data, return default values
+                return [0, 0, 0]
+
             data, target = data.to(device), target.to(device)
 
             if is_naive:
                 outputs = model(data)
                 _, predicted = torch.max(outputs, 1)
             else:
-                outputs, _, _, _ = model(data)
+                # May need to handle different return formats
+                try:
+                    outputs, _, _, _ = model(data)
+                except ValueError:
+                    outputs = model(data)[0]  # Just get the logits
+
                 _, predicted = torch.max(outputs, 1)
 
             # Count correct predictions by difficulty
@@ -206,8 +218,6 @@ def evaluate_by_difficulty(model, test_loader, is_naive=False):
     # Calculate accuracy for each difficulty level
     accuracy = [100 * c / t if t > 0 else 0 for c, t in zip(correct, total)]
     return accuracy
-
-
 # Function to plot and save all comparison graphs
 def plot_metrics(metrics, epochs, save_dir="results/plots"):
     """Generate and save plots comparing LayerSkip and standard MoE"""
