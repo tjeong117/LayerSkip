@@ -1,6 +1,6 @@
 import dataclasses
 import math
-from typing import Any, Optional, Tuple
+from typing import Any, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -13,12 +13,16 @@ from colossalai.moe.routers import MoeRouter, get_router_cls
 from colossalai.moe.utils import create_ep_hierarchical_group, get_noise_generator
 from colossalai.tensor.moe_tensor.api import get_dp_group, get_ep_group, get_ep_group_ranks, get_ep_size
 
-
 import json
 import numpy as np
 
-class SparseMLP(nn.Module):
-    """A class for users to create MoE modules in their models.
+
+class SparseMLPWithLayerSkip(nn.Module):
+    """A class for users to create MoE modules with LayerSkip functionality.
+
+    This enhances the original SparseMLP with early exit capabilities, allowing the model
+    to dynamically skip processing in subsequent layers for tokens that already have
+    high-confidence representations.
 
     Args:
         dim_model (int): Hidden dimension of training model
@@ -28,45 +32,39 @@ class SparseMLP(nn.Module):
         capacity_factor_eval (float, optional): Capacity factor in routing during evaluation
         min_capacity (int, optional): The minimum number of the capacity of each expert
         noisy_policy (str, optional): The policy of noisy function. Now we have 'Jitter' and 'Gaussian'.
-            'Jitter' can be found in `Switch Transformer paper`_.
-            'Gaussian' can be found in `ViT-MoE paper`_.
         drop_tks (bool, optional): Whether drops tokens in evaluation
-        use_residual (bool, optional): Makes this MoE layer a Residual MoE.
-            More information can be found in `Microsoft paper`_.
-        residual_instance (nn.Module, optional): The instance of residual module in Residual MoE
-        expert_instance (MoeExperts, optional): The instance of experts module in MoeLayer
-        expert_cls (Type[nn.Module], optional): The class of each expert when no instance is given
-        expert_args (optional): The args of expert when no instance is given
-
-    .. _Switch Transformer paper:
-        https://arxiv.org/abs/2101.03961
-    .. _ViT-MoE paper:
-        https://arxiv.org/abs/2106.05974
-    .. _Microsoft paper:
-        https://arxiv.org/abs/2201.05596
+        enable_layerskip (bool, optional): Whether to enable the LayerSkip functionality
+        confidence_threshold (float, optional): Threshold for early exit confidence score
+        expert_dropout_rate (float, optional): Dropout rate for experts during training
+        auxiliary_loss_weight (float, optional): Weight for auxiliary loss components
     """
 
     def __init__(
-        self,
-        num_experts: int,
-        hidden_size: int,
-        intermediate_size: int,
-        router_top_k: int = 1,
-        router_capacity_factor_train: float = 1.25,
-        router_capacity_factor_eval: float = 2.0,
-        router_min_capacity: int = 4,
-        router_noisy_policy: Optional[str] = None,
-        router_drop_tks: bool = True,
-        mlp_activation: Optional[str] = None,
-        mlp_gated: bool = False,
-        enable_load_balance: bool = False,
-        load_balance_tolerance: float = 0.1,
-        load_balance_beam_width: int = 8,
-        load_balance_group_swap_factor: float = 0.4,
-        enable_kernel: bool = False,
-        enable_comm_overlap: bool = False,
-        enable_hierarchical_comm: bool = False,
-        model_output_dir: str = None,
+            self,
+            num_experts: int,
+            hidden_size: int,
+            intermediate_size: int,
+            router_top_k: int = 1,
+            router_capacity_factor_train: float = 1.25,
+            router_capacity_factor_eval: float = 2.0,
+            router_min_capacity: int = 4,
+            router_noisy_policy: Optional[str] = None,
+            router_drop_tks: bool = True,
+            mlp_activation: Optional[str] = None,
+            mlp_gated: bool = False,
+            enable_load_balance: bool = False,
+            load_balance_tolerance: float = 0.1,
+            load_balance_beam_width: int = 8,
+            load_balance_group_swap_factor: float = 0.4,
+            enable_kernel: bool = False,
+            enable_comm_overlap: bool = False,
+            enable_hierarchical_comm: bool = False,
+            model_output_dir: str = None,
+            # LayerSkip specific parameters
+            enable_layerskip: bool = True,
+            confidence_threshold: float = 0.8,
+            expert_dropout_rate: float = 0.2,
+            auxiliary_loss_weight: float = 0.3,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -77,6 +75,13 @@ class SparseMLP(nn.Module):
         self.enable_comm_overlap = enable_comm_overlap
         self.expert_parallel = MOE_MANAGER.get_parallel()
         self.model_output_dir = model_output_dir
+
+        # LayerSkip specific variables
+        self.enable_layerskip = enable_layerskip
+        self.confidence_threshold = confidence_threshold
+        self.expert_dropout_rate = expert_dropout_rate
+        self.auxiliary_loss_weight = auxiliary_loss_weight
+        self.training_mode = True  # Tracks if we're in training or evaluation mode
 
         # For MoE Analysis
         if self.model_output_dir is not None:
@@ -139,30 +144,108 @@ class SparseMLP(nn.Module):
                 group_swap_factor=load_balance_group_swap_factor,
             )
 
+        # LayerSkip components
+        if self.enable_layerskip:
+            # Confidence predictor network
+            self.confidence_predictor = nn.Sequential(
+                nn.Linear(self.hidden_size, self.hidden_size // 2),
+                nn.ReLU(),
+                nn.Linear(self.hidden_size // 2, 1)
+            )
+
+            # Input complexity estimator - helps determine if input is "easy" or "hard"
+            self.complexity_estimator = nn.Linear(self.hidden_size, 1)
+
+            # Register buffer to track expert utilization for load balancing
+            self.register_buffer('expert_utilization', torch.zeros(num_experts))
+
+        # Layer normalization for input (helps with early exit decisions)
+        self.layer_norm = nn.LayerNorm(self.hidden_size)
+
         # init param
         self.reset_parameters()
+
+        # Early exit statistics tracking
+        self.early_exit_stats = {
+            'total_tokens': 0,
+            'early_exits': 0,
+            'confidence_scores': [],
+            'complexity_scores': []
+        }
 
     @torch.no_grad()
     def reset_parameters(self):
         torch.nn.init.normal_(self.gate_weight, std=math.sqrt(0.1 / self.hidden_size))
+        if self.enable_layerskip:
+            # Initialize confidence predictor with slightly conservative values
+            # (biased toward not exiting early)
+            for module in self.confidence_predictor.modules():
+                if isinstance(module, nn.Linear):
+                    torch.nn.init.xavier_normal_(module.weight)
+                    if module.bias is not None:
+                        torch.nn.init.constant_(module.bias, -1.0)  # Initially conservative
 
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+    def reset_utilization_stats(self):
+        """Reset the expert utilization tracking."""
+        if self.enable_layerskip:
+            self.expert_utilization.zero_()
+            self.early_exit_stats = {
+                'total_tokens': 0,
+                'early_exits': 0,
+                'confidence_scores': [],
+                'complexity_scores': []
+            }
+
+    def forward(self, inputs: torch.Tensor, return_metrics: bool = False) -> Union[
+        torch.Tensor, Tuple[torch.Tensor, dict]]:
         """
         Args:
             inputs (torch.Tensor): The input tensor of shape (batch_size, seq_len, hidden_size)
+            return_metrics (bool): Whether to return additional metrics
 
         Returns:
-            torch.Tensor: The output tensor of shape (batch_size, seq_len, hidden_size)
+            torch.Tensor or Tuple[torch.Tensor, dict]: The output tensor of shape (batch_size, seq_len, hidden_size)
+                and optionally metrics for analysis
         """
         # reshape the input tokens
         tokens = inputs.reshape(-1, self.hidden_size)
+        batch_size = tokens.shape[0]
+
+        # Store original input for residual connection and early exit
+        residual = tokens
+
+        # Apply layer normalization (helps with confidence prediction)
+        tokens = self.layer_norm(tokens)
+
+        # Calculate input complexity if LayerSkip is enabled
+        complexity_score = None
+        if self.enable_layerskip:
+            complexity_score = torch.sigmoid(self.complexity_estimator(tokens)).mean()
 
         # the data type of the inputs in the gating should be fp32
         fp32_input = tokens.to(torch.float)
         fp32_weight = self.gate_weight.to(torch.float)
         gate_output = F.linear(fp32_input, fp32_weight)
 
-        # update expert load
+        # Apply expert dropout during training with dynamic rate based on complexity
+        if self.training and self.expert_dropout_rate > 0 and self.enable_layerskip:
+            # Create a mask for expert dropout
+            expert_mask = torch.rand(self.num_experts, device=tokens.device) > self.expert_dropout_rate
+
+            # Ensure at least top_k experts are active
+            if expert_mask.sum() < self.topk:
+                inactive_indices = torch.where(~expert_mask)[0]
+                to_activate = min(self.topk - expert_mask.sum().item(), len(inactive_indices))
+                if to_activate > 0:
+                    indices_to_activate = inactive_indices[torch.randperm(len(inactive_indices))[:to_activate]]
+                    expert_mask[indices_to_activate] = True
+
+            # Apply mask to gate output by setting logits for dropped experts to a large negative value
+            masked_gate_output = gate_output.clone()
+            masked_gate_output[:, ~expert_mask] = -1e10
+            gate_output = masked_gate_output
+
+        # update expert load for load balancing
         if self.enable_load_balance == True:
             with torch.no_grad():
                 # TODO: optimize computation
@@ -175,24 +258,87 @@ class SparseMLP(nn.Module):
         used_capacity, *route_result_list = self.router(
             inputs=gate_output, use_kernel=self.enable_kernel, ep_group=self.ep_group)
 
-        
-        # Convert variables to NumPy arrays
-        gate_output_np = gate_output.detach().cpu().numpy()
-        used_capacity_np = used_capacity.detach().cpu().numpy()
-        dispatch_mask_np = route_result_list[1].detach().cpu().numpy()
-        combine_score_np = route_result_list[0].detach().cpu().numpy()
+        # For LayerSkip - track which experts are used and update utilization
+        if self.enable_layerskip and self.training:
+            # Extract top-k expert indices
+            top_indices = route_result_list[1]  # shape: [topk, batch_size, capacity]
+            # Flatten to get all expert indices
+            expert_indices = top_indices.reshape(-1)
+            # Update expert utilization
+            for idx in expert_indices:
+                self.expert_utilization[idx] += 1
 
-        # Create a dictionary to store the NumPy arrays
-        data = {
-            "gate_output": gate_output_np.tolist(),
-            "used_capacity": used_capacity_np.tolist(),
-            "dispatch_mask": dispatch_mask_np.tolist(),
-            "combine_score": combine_score_np.tolist()
-        }
+        # Check for early exit condition
+        early_exit = False
+        confidence_score = None
+        early_exit_metadata = {}
 
-        # Save the dictionary to the output JSON file
-        json.dump(data, self.output_json_file)
-        self.output_json_file.write('\n')
+        if self.enable_layerskip and not self.training:
+            # Predict confidence for early exit
+            confidence_logits = self.confidence_predictor(tokens)
+            confidence_score = torch.sigmoid(confidence_logits).mean()
+
+            # Adjust confidence threshold based on complexity
+            if complexity_score is not None:
+                # Make threshold higher for complex inputs (harder to exit early)
+                adjusted_threshold = self.confidence_threshold * (1.0 + 0.2 * complexity_score)
+            else:
+                adjusted_threshold = self.confidence_threshold
+
+            # Check if confidence exceeds threshold
+            if confidence_score > adjusted_threshold:
+                early_exit = True
+
+                # Store statistics
+                self.early_exit_stats['total_tokens'] += batch_size
+                self.early_exit_stats['early_exits'] += batch_size
+                self.early_exit_stats['confidence_scores'].append(confidence_score.item())
+                if complexity_score is not None:
+                    self.early_exit_stats['complexity_scores'].append(complexity_score.item())
+
+                # Prepare early exit metadata
+                early_exit_metadata = {
+                    'early_exit': True,
+                    'confidence_score': confidence_score.item(),
+                    'complexity_score': complexity_score.item() if complexity_score is not None else None,
+                    'threshold': adjusted_threshold
+                }
+
+                # Skip expert computation and return
+                if return_metrics:
+                    return residual, early_exit_metadata
+                return residual
+
+        # If no early exit, update stats
+        if self.enable_layerskip and not self.training:
+            self.early_exit_stats['total_tokens'] += batch_size
+
+        # Convert variables to NumPy arrays for analysis if output directory is specified
+        if self.model_output_dir is not None:
+            gate_output_np = gate_output.detach().cpu().numpy()
+            used_capacity_np = used_capacity.detach().cpu().numpy()
+            dispatch_mask_np = route_result_list[1].detach().cpu().numpy()
+            combine_score_np = route_result_list[0].detach().cpu().numpy()
+
+            # Create a dictionary to store the NumPy arrays
+            data = {
+                "gate_output": gate_output_np.tolist(),
+                "used_capacity": used_capacity_np.tolist(),
+                "dispatch_mask": dispatch_mask_np.tolist(),
+                "combine_score": combine_score_np.tolist()
+            }
+
+            # Add LayerSkip metrics if available
+            if self.enable_layerskip:
+                if confidence_score is not None:
+                    data["confidence_score"] = confidence_score.item()
+                if complexity_score is not None:
+                    data["complexity_score"] = complexity_score.item()
+                data["early_exit"] = early_exit
+
+            # Save the dictionary to the output JSON file
+            json.dump(data, self.output_json_file)
+            self.output_json_file.write('\n')
 
         # dispatch_data: (num_experts, capacity, hidden_size)
         if self.enable_kernel:
@@ -230,7 +376,18 @@ class SparseMLP(nn.Module):
             expert_output = expert_output.view(-1, expert_output.shape[-1])
             ans = torch.matmul(combine_weights, expert_output)
 
-        ans = ans.reshape(inputs.shape)
+        # Apply residual connection and reshape back
+        ans = ans.reshape(inputs.shape) + residual
+
+        # Return with early exit metadata if requested
+        if return_metrics:
+            metadata = {
+                'early_exit': False,
+                'confidence_score': confidence_score.item() if confidence_score is not None else None,
+                'complexity_score': complexity_score.item() if complexity_score is not None else None,
+            }
+            return ans, metadata
+
         return ans
 
     def _local_process(self, expert_in: torch.Tensor) -> torch.Tensor:
@@ -239,10 +396,10 @@ class SparseMLP(nn.Module):
         return expert_out
 
     def _ep_process(
-        self,
-        dispatch_data: torch.Tensor,
-        used_capacity: torch.Tensor,
-        overlap: bool = False
+            self,
+            dispatch_data: torch.Tensor,
+            used_capacity: torch.Tensor,
+            overlap: bool = False
     ) -> torch.Tensor:
         """
         Expert Parallel
@@ -255,10 +412,12 @@ class SparseMLP(nn.Module):
         """
         if not overlap or dist.get_world_size(self.ep_group) == 1:
             if self.ep_hierarchical_group is not None:
-                expert_input = HierarchicalAllToAll.apply(dispatch_data, self.ep_hierarchical_group, self.ep_intra_src_rank)
+                expert_input = HierarchicalAllToAll.apply(dispatch_data, self.ep_hierarchical_group,
+                                                          self.ep_intra_src_rank)
                 expert_input = expert_input.reshape(self.ep_size, self.num_local_experts, -1, self.hidden_size)
                 expert_output = self.experts(expert_input)
-                expert_output = HierarchicalAllToAll.apply(expert_output, self.ep_hierarchical_group, self.ep_intra_src_rank)
+                expert_output = HierarchicalAllToAll.apply(expert_output, self.ep_hierarchical_group,
+                                                           self.ep_intra_src_rank)
                 return expert_output
             else:
                 expert_input = AllToAll.apply(dispatch_data, self.ep_group, False)[0]
@@ -295,7 +454,7 @@ class SparseMLP(nn.Module):
 
                 # all2all last output
                 if _expert_out is not None:
-                    expert_out = Capsule(*AllToAll.apply(_expert_out.data, self.ep_group, True),)
+                    expert_out = Capsule(*AllToAll.apply(_expert_out.data, self.ep_group, True), )
                     _expert_out = None
 
                 # all2all next input
@@ -315,10 +474,10 @@ class SparseMLP(nn.Module):
             return output
 
     def _tp_process(
-        self,
-        dispatch_data: torch.Tensor,
-        used_capacity: torch.Tensor,
-        overlap: bool = False
+            self,
+            dispatch_data: torch.Tensor,
+            used_capacity: torch.Tensor,
+            overlap: bool = False
     ) -> torch.Tensor:
         """
         without overlap:
@@ -401,6 +560,54 @@ class SparseMLP(nn.Module):
 
             return output
 
+    def get_expert_utilization(self):
+        """Get expert utilization statistics."""
+        if self.enable_layerskip:
+            return self.expert_utilization.cpu().numpy()
+        return None
+
+    def get_early_exit_stats(self):
+        """Get early exit statistics."""
+        if self.enable_layerskip:
+            stats = self.early_exit_stats.copy()
+            if stats['total_tokens'] > 0:
+                stats['exit_rate'] = stats['early_exits'] / stats['total_tokens']
+            else:
+                stats['exit_rate'] = 0.0
+            if stats['confidence_scores']:
+                stats['avg_confidence'] = sum(stats['confidence_scores']) / len(stats['confidence_scores'])
+            else:
+                stats['avg_confidence'] = 0.0
+            if stats['complexity_scores']:
+                stats['avg_complexity'] = sum(stats['complexity_scores']) / len(stats['complexity_scores'])
+            else:
+                stats['avg_complexity'] = 0.0
+            return stats
+        return None
+
+    def compute_load_balancing_loss(self):
+        """Compute a load balancing loss to encourage uniform expert utilization."""
+        if not self.enable_layerskip:
+            return 0.0
+
+        # Normalize utilization to sum to 1
+        normalized_util = self.expert_utilization / (self.expert_utilization.sum() + 1e-5)
+        # Ideal uniform distribution
+        uniform_util = torch.ones_like(normalized_util) / self.num_experts
+        # KL divergence from uniform
+        loss = F.kl_div(normalized_util.log(), uniform_util, reduction='sum')
+        return loss
+
+    def train(self, mode=True):
+        super().train(mode)
+        self.training_mode = mode
+        return self
+
+    def eval(self):
+        super().eval()
+        self.training_mode = False
+        return self
+
 
 def apply_load_balance(model: nn.Module, optim: Any) -> None:
     """
@@ -409,7 +616,7 @@ def apply_load_balance(model: nn.Module, optim: Any) -> None:
 
     def _apply_recursive(module: nn.Module):
         for _, sub_module in module.named_children():
-            if isinstance(sub_module, SparseMLP):
+            if isinstance(sub_module, (SparseMLP, SparseMLPWithLayerSkip)):
                 if sub_module.enable_load_balance == True:
                     sub_module.load_balancer.balance_load(optim)
             _apply_recursive(sub_module)
@@ -417,3 +624,42 @@ def apply_load_balance(model: nn.Module, optim: Any) -> None:
     torch.cuda.empty_cache()
     _apply_recursive(model)
     torch.cuda.empty_cache()
+
+
+# Add a helper function to compute auxiliary losses for LayerSkip
+def compute_layerskip_loss(model: nn.Module, aux_outputs: list, targets: torch.Tensor) -> torch.Tensor:
+    """
+    Compute auxiliary loss for LayerSkip early exits
+
+    Args:
+        model (nn.Module): The model with MoE layers
+        aux_outputs (list): List of auxiliary outputs from intermediate layers
+        targets (torch.Tensor): Target labels or values
+
+    Returns:
+        torch.Tensor: The computed auxiliary loss
+    """
+    loss = 0.0
+    criterion = nn.CrossEntropyLoss()
+
+    # Compute loss for each auxiliary output
+    for i, aux_output in enumerate(aux_outputs):
+        # Weight earlier layers less
+        layer_weight = (i + 1) / len(aux_outputs)
+        aux_loss = criterion(aux_output, targets)
+        loss += layer_weight * aux_loss
+
+    # Add load balancing loss
+    def _collect_moe_modules(module, moe_modules):
+        if isinstance(module, SparseMLPWithLayerSkip) and module.enable_layerskip:
+            moe_modules.append(module)
+        for child in module.children():
+            _collect_moe_modules(child, moe_modules)
+
+    moe_modules = []
+    _collect_moe_modules(model, moe_modules)
+
+    for moe_module in moe_modules:
+        loss += moe_module.compute_load_balancing_loss() * 0.1  # Scaling factor for load balance
+
+    return loss
