@@ -183,6 +183,29 @@ class SimpleClassifier(nn.Module):
         return logits, layer_exits, confidence_scores, len(self.layers)
 
 
+class SimpleClassifierRotation(SimpleClassifier):
+    def __init__(self, input_dim=64, hidden_dim=128, num_layers=2,
+                 num_classes=4, expert_count=4, top_k=2, enable_layer_skip=True,
+                 confidence_thresholds=None, rotation_interval=50):
+        super().__init__(input_dim, hidden_dim, num_layers, num_classes, 
+                         expert_count, top_k, enable_layer_skip, confidence_thresholds)
+        
+        # Rotation interval (in batches) for early exit loss
+        self.rotation_interval = rotation_interval
+        
+    def get_active_layers(self, batch_idx, num_active_layers=None):
+        if num_active_layers is None:
+            num_active_layers = max(1, len(self.layers) // 2)  # Default: activate half of the layers
+        
+        # Determine which set of layers is active for this batch
+        rotation_step = (batch_idx // self.rotation_interval) % len(self.layers)
+        
+        # Create a circular mask of active layers starting from rotation_step
+        active_layers = [(rotation_step + i) % len(self.layers) for i in range(num_active_layers)]
+        
+        return active_layers
+
+
 # Naive model for comparison
 class NaiveClassifier(nn.Module):
     def __init__(self, input_dim=64, hidden_dim=128, num_layers=2, num_classes=4):
@@ -357,6 +380,155 @@ def train_model(model, train_loader, val_loader, epochs=5, lr=0.001, aux_loss_we
     return train_losses, val_accuracies, early_exit_stats, epoch_times, avg_epoch_time
 
 
+# Training function with rotational early exit loss 
+def train_model_with_rotational_curriculum(model, train_loader, val_loader, epochs=5, lr=0.001, 
+                                           aux_loss_weight=0.3, is_naive=False,
+                                           rotation_interval=50):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    print(f"Training with rotational curriculum, rotation interval: {rotation_interval} batches")
+
+    model = model.to(device)
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.CrossEntropyLoss()
+
+    train_losses = []
+    val_accuracies = []
+    early_exit_stats = []
+    epoch_times = []
+    
+    # Track which layers are active for early exit in each iteration
+    active_layer_history = []
+    
+    step_counter = 0
+    
+    # Number of layers in the model
+    if not is_naive:
+        num_layers = len(model.layers)
+    
+    for epoch in range(epochs):
+        model.train()
+        total_loss = 0
+
+        start_time = time.time()
+        for batch_idx, (data, target) in enumerate(train_loader):
+            data, target = data.to(device), target.to(device)
+
+            optimizer.zero_grad()
+
+            # Forward pass
+            if is_naive:
+                logits = model(data)
+                loss = criterion(logits, target)
+            else:
+                # Forward pass with auxiliary logits for MoE model
+                logits, _, _, _, aux_logits = model(data, return_aux_logits=True)
+
+                # Main loss
+                main_loss = criterion(logits, target)
+
+                # Rotational curriculum - determine active layers
+                rotation_phase = (step_counter // rotation_interval) % num_layers
+                
+                # Select which layers have active early exit loss
+                # In rotational curriculum, we enable early exit loss for a subset of layers
+                # that rotates through the network over time
+                
+                # Calculate how many layers to activate in this phase (at least 1)
+                active_count = max(1, num_layers // 2)
+                
+                # Generate indices of active layers, wrapping around if needed
+                active_layers = [(rotation_phase + i) % num_layers for i in range(active_count)]
+                
+                # Record which layers are active in this step
+                if batch_idx % 50 == 0:
+                    active_layer_history.append(active_layers)
+                    print(f"Step {step_counter}, Rotation phase {rotation_phase}, Active layers: {active_layers}")
+
+                # Auxiliary losses - only apply to active layers
+                aux_loss_sum = 0
+                for idx, aux_logit in enumerate(aux_logits):
+                    if idx in active_layers:
+                        # Weight the loss based on layer depth
+                        weight = aux_loss_weight * (idx + 1) / len(aux_logits)
+                        aux_loss = weight * criterion(aux_logit, target)
+                        aux_loss_sum += aux_loss
+
+                # Total loss
+                loss = main_loss + aux_loss_sum
+
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+            step_counter += 1
+
+            if batch_idx % 50 == 0:
+                print(f'Train Epoch: {epoch} [{batch_idx * len(data)}/{len(train_loader.dataset)} '
+                      f'({100. * batch_idx / len(train_loader):.0f}%)]\tLoss: {loss.item():.6f}')
+
+        train_losses.append(total_loss / len(train_loader))
+
+        # Validation
+        model.eval()
+        correct = 0
+
+        # For non-naive models, we track early exits
+        if not is_naive:
+            layer_exits_count = [0] * (len(model.layers) + 1)  # +1 for final layer
+
+        with torch.no_grad():
+            for data, target in val_loader:
+                data, target = data.to(device), target.to(device)
+
+                # Forward pass
+                if is_naive:
+                    logits = model(data)
+                    pred = logits.argmax(dim=1, keepdim=True)
+                else:
+                    logits, layer_exits, confidences, exit_layer = model(data)
+                    # Count exits per layer
+                    layer_exits_count[exit_layer] += 1
+                    pred = logits.argmax(dim=1, keepdim=True)
+
+                correct += pred.eq(target.view_as(pred)).sum().item()
+
+        accuracy = 100. * correct / len(val_loader.dataset)
+        val_accuracies.append(accuracy)
+
+        # Calculate early exit stats if not naive model
+        if not is_naive:
+            early_exit_percentages = [count / len(val_loader.dataset) * 100 for count in layer_exits_count]
+            early_exit_stats.append(early_exit_percentages)
+            print(f'Early exits per layer: {early_exit_percentages}')
+
+        epoch_time = time.time() - start_time
+        epoch_times.append(epoch_time)
+
+        print(f'Epoch {epoch}: Train Loss: {train_losses[-1]:.4f}, '
+              f'Validation Accuracy: {accuracy:.2f}%, Time: {epoch_time:.2f}s')
+
+    # Calculate average epoch time
+    avg_epoch_time = sum(epoch_times) / len(epoch_times)
+    print(f"Average epoch time: {avg_epoch_time:.2f}s")
+
+    # Plot the active layer history to visualize the rotation
+    if not is_naive and active_layer_history:
+        plt.figure(figsize=(12, 6))
+        for step_idx, active_layers in enumerate(active_layer_history):
+            for layer in active_layers:
+                plt.scatter(step_idx, layer, c='blue', s=20)
+        plt.title('Rotational Curriculum - Active Layers Over Time')
+        plt.xlabel('Training Steps (every 50 batches)')
+        plt.ylabel('Layer Index')
+        plt.yticks(range(num_layers))
+        plt.grid(True, alpha=0.3)
+        plt.savefig('rotational_curriculum_visualization.png')
+        plt.close()
+
+    return train_losses, val_accuracies, early_exit_stats, epoch_times, avg_epoch_time, active_layer_history
+
+
 # Function to evaluate and visualize results
 def evaluate_model(model, test_loader, is_naive=False):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -450,7 +622,7 @@ def evaluate_model(model, test_loader, is_naive=False):
     return accuracy, avg_inference_time
 
 
-# Compare all models (with LayerSkip, without LayerSkip, and naive)
+# Compare all models (with LayerSkip, without LayerSkip, naive, and with rotation)
 def compare_model_performance():
     # Generate synthetic data
     print("Generating synthetic data...")
@@ -466,6 +638,12 @@ def compare_model_performance():
     model_without_skip = SimpleClassifier(
         input_dim=input_dim,
         enable_layer_skip=False
+    )
+    
+    model_with_rotation = SimpleClassifier(
+        input_dim=input_dim,
+        enable_layer_skip=True,
+        confidence_thresholds=[0.7, 0.8],
     )
 
     naive_model = NaiveClassifier(
@@ -484,6 +662,12 @@ def compare_model_performance():
     train_losses_no_skip, val_accuracies_no_skip, _, epoch_times_no_skip, avg_time_no_skip = train_model(
         model_without_skip, train_loader, test_loader, epochs=5
     )
+    
+    print("\nTraining model with LayerSkip and Rotational Curriculum...")
+    train_losses_rotation, val_accuracies_rotation, exit_stats_rotation, epoch_times_rotation, avg_time_rotation, active_layer_history = train_model_with_rotational_curriculum(
+        model_with_rotation, train_loader, test_loader, epochs=5,
+        rotation_interval=50  # Rotate every 50 batches
+    )
 
     print("\nTraining naive model...")
     train_losses_naive, val_accuracies_naive, _, epoch_times_naive, avg_time_naive = train_model(
@@ -496,6 +680,9 @@ def compare_model_performance():
 
     print("\nEvaluating model without LayerSkip...")
     accuracy_no_skip, time_no_skip, _, _ = evaluate_model(model_without_skip, test_loader)
+    
+    print("\nEvaluating model with LayerSkip and Rotational Curriculum...")
+    accuracy_rotation, time_rotation, exits_rotation, _ = evaluate_model(model_with_rotation, test_loader)
 
     print("\nEvaluating naive model...")
     accuracy_naive, time_naive = evaluate_model(naive_model, test_loader, is_naive=True)
@@ -507,14 +694,18 @@ def compare_model_performance():
     print(
         f"No LayerSkip: Accuracy={accuracy_no_skip:.2f}%, Inference time={time_no_skip * 1000:.2f}ms, Training time/epoch={avg_time_no_skip:.2f}s")
     print(
+        f"LayerSkip with Rotation: Accuracy={accuracy_rotation:.2f}%, Inference time={time_rotation * 1000:.2f}ms, Training time/epoch={avg_time_rotation:.2f}s")
+    print(
         f"Naive model: Accuracy={accuracy_naive:.2f}%, Inference time={time_naive * 1000:.2f}ms, Training time/epoch={avg_time_naive:.2f}s")
     print(f"Inference Speedup vs. Naive: {time_naive / time_skip:.2f}x")
     print(f"Training Speedup vs. Naive: {avg_time_naive / avg_time_skip:.2f}x")
+    print(f"Training Speedup Rotation vs. Standard: {avg_time_skip / avg_time_rotation:.2f}x")
 
     # Plot training loss comparison
     plt.figure(figsize=(10, 5))
     plt.plot(train_losses_skip, label='With LayerSkip')
     plt.plot(train_losses_no_skip, label='Without LayerSkip')
+    plt.plot(train_losses_rotation, label='With Rotation')
     plt.plot(train_losses_naive, label='Naive')
     plt.title('Training Loss Comparison')
     plt.xlabel('Epoch')
@@ -526,6 +717,7 @@ def compare_model_performance():
     plt.figure(figsize=(10, 5))
     plt.plot(val_accuracies_skip, label='With LayerSkip')
     plt.plot(val_accuracies_no_skip, label='Without LayerSkip')
+    plt.plot(val_accuracies_rotation, label='With Rotation')
     plt.plot(val_accuracies_naive, label='Naive')
     plt.title('Validation Accuracy Comparison')
     plt.xlabel('Epoch')
@@ -538,6 +730,7 @@ def compare_model_performance():
     epochs = range(5)
     plt.plot(epochs, epoch_times_skip, marker='o', label='With LayerSkip')
     plt.plot(epochs, epoch_times_no_skip, marker='s', label='Without LayerSkip')
+    plt.plot(epochs, epoch_times_rotation, marker='d', label='With Rotation')
     plt.plot(epochs, epoch_times_naive, marker='^', label='Naive')
     plt.title('Training Time Comparison')
     plt.xlabel('Epoch')
@@ -547,15 +740,15 @@ def compare_model_performance():
     plt.savefig('training_time_comparison.png')
 
     # Bar chart for average training and inference times
-    plt.figure(figsize=(12, 6))
-    models = ['LayerSkip', 'No LayerSkip', 'Naive']
-    train_times = [avg_time_skip, avg_time_no_skip, avg_time_naive]
-    infer_times = [time_skip * 1000, time_no_skip * 1000, time_naive * 1000]  # Convert to ms
+    plt.figure(figsize=(14, 6))
+    models = ['LayerSkip', 'No LayerSkip', 'Rotation', 'Naive']
+    train_times = [avg_time_skip, avg_time_no_skip, avg_time_rotation, avg_time_naive]
+    infer_times = [time_skip * 1000, time_no_skip * 1000, time_rotation * 1000, time_naive * 1000]  # Convert to ms
 
     x = np.arange(len(models))
     width = 0.35
 
-    fig, ax1 = plt.subplots(figsize=(12, 6))
+    fig, ax1 = plt.subplots(figsize=(14, 6))
     ax2 = ax1.twinx()
 
     bar1 = ax1.bar(x - width / 2, train_times, width, label='Avg. Training Time (s/epoch)', color='skyblue')
@@ -575,7 +768,7 @@ def compare_model_performance():
     plt.tight_layout()
     plt.savefig('time_comparison.png')
 
-    return model_with_skip, model_without_skip, naive_model
+    return model_with_skip, model_without_skip, model_with_rotation, naive_model
 
 
 if __name__ == "__main__":
@@ -585,11 +778,12 @@ if __name__ == "__main__":
 
     # Run comparison
     print("Starting model comparison...")
-    model_with_skip, model_without_skip, naive_model = compare_model_performance()
+    model_with_skip, model_without_skip, model_with_rotation, naive_model = compare_model_performance()
 
     # Save trained models
     torch.save(model_with_skip.state_dict(), 'model_with_layerskip.pt')
     torch.save(model_without_skip.state_dict(), 'model_without_layerskip.pt')
+    torch.save(model_with_rotation.state_dict(), 'model_with_rotation.pt')
     torch.save(naive_model.state_dict(), 'naive_model.pt')
 
     print("Completed! Models saved.")
