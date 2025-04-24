@@ -380,7 +380,7 @@ def train_model(model, train_loader, val_loader, epochs=5, lr=0.001, aux_loss_we
     return train_losses, val_accuracies, early_exit_stats, epoch_times, avg_epoch_time
 
 
-# Training function with rotational early exit loss curriculum
+# Training function with rotational early exit loss 
 def train_model_with_rotational_curriculum(model, train_loader, val_loader, epochs=5, lr=0.001, 
                                            aux_loss_weight=0.3, is_naive=False,
                                            rotation_interval=50):
