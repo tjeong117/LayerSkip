@@ -39,68 +39,80 @@ class MoELayerWithSkip(nn.Module):
         self.confidence_predictor = nn.Linear(input_dim, 1)
         self.layer_norm = nn.LayerNorm(input_dim)
 
-    def forward(self, x):
-        # Layer normalization and save residual
+    def forward(self, x, return_metrics=False):
+        # Layer normalization
         residual = x
-        x_norm = self.layer_norm(x)
+        x = self.layer_norm(x)
 
-        # Compute confidence score from the normalized input *before* the block
-        # (Though applying after the block might also be valid)
-        confidence = torch.zeros(x.shape[0], 1, device=x.device) # Default confidence is 0
-        if self.enable_layer_skip:
-            # Sigmoid ensures confidence is between 0 and 1
-            confidence = torch.sigmoid(self.confidence_predictor(x_norm))
-
-        # --- MoE Routing and Expert Processing --- #
-
-        # Get router logits from normalized input
-        router_logits = self.router(x_norm)
+        # Get router logits
+        router_logits = self.router(x)
 
         # Apply expert dropout during training
         if self.training and self.expert_dropout_rate > 0:
             expert_mask = torch.rand(self.expert_count, device=x.device) > self.expert_dropout_rate
+            # Ensure at least one expert is active
             if not expert_mask.any():
                 expert_mask[torch.randint(0, self.expert_count, (1,))] = True
+
+            # Apply mask to router logits
             router_logits = router_logits.masked_fill(~expert_mask.unsqueeze(0), -1e10)
 
+        # Get routing probabilities and indices
         router_probs = F.softmax(router_logits, dim=-1)
+
+        # Get top-k experts
         vals, indices = torch.topk(router_probs, self.top_k, dim=-1)
+
+        # Normalize the router probabilities
         vals = vals / vals.sum(dim=-1, keepdim=True)
+
+        # Compute early exit confidence if enabled
+        early_exit = False
+        confidence_score = 0.0
+
+        if self.enable_layer_skip and not self.training:
+            confidence = torch.sigmoid(self.confidence_predictor(x))
+            confidence_score = confidence.mean().item()
+
+            # Check if we should exit early
+            if confidence_score > self.confidence_threshold:
+                early_exit = True
+                # Just return the input if we exit early
+                if return_metrics:
+                    return residual + x, early_exit, vals, indices, router_probs, confidence_score
+                return residual + x, early_exit, confidence_score
 
         # Process through experts
         batch_size = x.shape[0]
-        combined_output = torch.zeros_like(x) # Use original shape
 
-        # TODO: Optimize this expert computation (e.g., using scatter/gather)
+        # Initialize output tensor
+        combined_output = torch.zeros_like(x)
+
+        # Simple MoE computation
         for b in range(batch_size):
             for k in range(self.top_k):
                 expert_idx = indices[b, k].item()
                 weight = vals[b, k].item()
-                # Pass the *normalized* input to experts
-                expert_output = self.experts[expert_idx](x_norm[b].unsqueeze(0))
+                expert_output = self.experts[expert_idx](x[b].unsqueeze(0))
                 combined_output[b] += weight * expert_output.squeeze(0)
 
-        # --- Final Output Calculation --- #
-
-        # Add residual to the expert output
+        # Residual connection
         output = residual + combined_output
 
-        # Return the main output, the per-sample confidence, and the original residual
-        # We no longer return routing metrics etc. by default to simplify
-        return output, confidence, residual
+        if return_metrics:
+            return output, early_exit, vals, indices, router_probs, confidence_score
+        return output, early_exit, confidence_score
 
 
 class SimpleClassifier(nn.Module):
     def __init__(self, input_dim=64, hidden_dim=128, num_layers=2,
                  num_classes=4, expert_count=4, top_k=2, enable_layer_skip=True,
-                 confidence_thresholds=None, rotation_step=0):
+                 confidence_thresholds=None):
         super().__init__()
 
         self.input_layer = nn.Linear(input_dim, hidden_dim)
         self.enable_layer_skip = enable_layer_skip
         self.num_layers = num_layers
-        self.rotation_step = rotation_step if rotation_step > 0 else 0
-        self.current_rotation_offset = 0
 
         if confidence_thresholds is None:
             confidence_thresholds = [0.5] * num_layers
@@ -125,11 +137,6 @@ class SimpleClassifier(nn.Module):
         # Final classifier
         self.classifier = nn.Linear(hidden_dim, num_classes)
 
-    def advance_rotation(self):
-        """Advances the rotation offset for the curriculum."""
-        if self.rotation_step > 0:
-            self.current_rotation_offset = (self.current_rotation_offset + 1) % self.rotation_step
-
     def train(self, mode=True):
         super().train(mode)
         # Set training mode for all layers
@@ -145,83 +152,36 @@ class SimpleClassifier(nn.Module):
         return self
 
     def forward(self, x, return_aux_logits=False):
-        batch_size = x.shape[0]
-        device = x.device
-        hidden_dim = self.input_layer.out_features
-        num_classes = self.classifier.out_features
-
         # Initial layer
         x = F.relu(self.input_layer(x))
 
-        # Initialization for per-sample tracking
-        final_logits = torch.zeros(batch_size, num_classes, device=device)
-        # Default exit layer is num_layers (meaning final classifier)
-        exit_layer = torch.full((batch_size,), self.num_layers, dtype=torch.long, device=device)
-        has_exited = torch.zeros(batch_size, dtype=torch.bool, device=device)
-        all_aux_logits = [] # Stores aux logits from *all* layers for loss calculation
-        # Stores confidence scores for samples *at the point they exited* (for potential analysis)
-        exit_confidences = torch.zeros(batch_size, device=device)
+        aux_logits = []
+        layer_exits = []
+        confidence_scores = []
 
         # Process through MoE layers
         for i, (layer, aux_cls) in enumerate(zip(self.layers, self.aux_classifiers)):
-            # Pass current state through the layer
-            # Layer returns: output, confidence, residual_before_layer
-            current_x, current_confidence, _ = layer(x)
+            x, early_exit, conf = layer(x)
 
-            # Compute auxiliary logits using the output of the MoE layer
-            # We compute this for *all* samples, even those that might exit now,
-            # because aux loss might still be needed for training.
-            current_aux_logits = aux_cls(current_x)
-            all_aux_logits.append(current_aux_logits)
+            # Store metrics
+            layer_exits.append(early_exit)
+            confidence_scores.append(conf)
 
-            # --- Per-Sample Early Exit Check (only during evaluation) ---
-            if not self.training and self.enable_layer_skip:
-                # Determine which samples *could* exit based on confidence
-                # Squeeze confidence tensor for boolean indexing
-                should_exit = (current_confidence.squeeze() > layer.confidence_threshold)
+            # Compute auxiliary logits for this layer
+            aux_logits.append(aux_cls(x))
 
-                # Identify samples exiting *at this specific layer*
-                # (i.e., they meet threshold AND haven't exited yet)
-                exiting_now = should_exit & ~has_exited
+            # Exit early if enabled and confidence is high
+            if early_exit and self.enable_layer_skip and not self.training:
+                if return_aux_logits:
+                    return aux_logits[i], layer_exits, confidence_scores, i
+                return aux_logits[i], layer_exits, confidence_scores, i
 
-                if exiting_now.any():
-                    # Store the aux logits of *this* layer as the final prediction for these samples
-                    final_logits[exiting_now] = current_aux_logits[exiting_now]
-                    # Record the exit layer index
-                    exit_layer[exiting_now] = i
-                    # Store their confidence score at exit
-                    exit_confidences[exiting_now] = current_confidence[exiting_now].squeeze()
-                    # Mark these samples as exited
-                    has_exited[exiting_now] = True
+        # Final prediction if no early exit
+        logits = self.classifier(x)
 
-            # Update the state for the next layer iteration
-            # Samples keep propagating even if marked as exited, simplifies logic,
-            # but their final_logits are already set.
-            x = current_x
-
-            # Optimization: if all samples have exited, break the loop
-            if not self.training and has_exited.all():
-                break
-
-        # --- Final Classifier for Non-Exited Samples --- #
-
-        # Identify samples that went through all layers
-        non_exited_mask = ~has_exited
-        if non_exited_mask.any():
-            # Apply the final classifier only to these samples
-            final_layer_logits = self.classifier(x[non_exited_mask])
-            # Store these logits in the final_logits tensor
-            final_logits[non_exited_mask] = final_layer_logits
-            # Confidence for these is conventionally 1.0 (or handled differently if needed)
-            exit_confidences[non_exited_mask] = 1.0 # Placeholder value
-
-        # Return final logits, per-sample exit layer indices, and all computed aux logits
         if return_aux_logits:
-            # Note: exit_confidences are also available if needed for analysis
-            return final_logits, exit_layer, all_aux_logits
-        else:
-            # Standard return for evaluation might just be logits and exit layers
-            return final_logits, exit_layer
+            return logits, layer_exits, confidence_scores, len(self.layers), aux_logits
+        return logits, layer_exits, confidence_scores, len(self.layers)
 
 
 # Naive model for comparison
@@ -295,7 +255,156 @@ def generate_synthetic_data(num_samples=10000, input_dim=64, num_classes=4):
     return train_loader, test_loader, input_dim
 
 
-# Training function with early exit loss
+# NEW: Training function with rotational curriculum for early exit loss
+def train_model_with_rotational_curriculum(model, train_loader, val_loader, epochs=5, lr=0.001, 
+                                           aux_loss_weight=0.3, is_naive=False,
+                                           rotation_interval=50):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    print(f"Training with rotational curriculum, rotation interval: {rotation_interval} batches")
+
+    model = model.to(device)
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.CrossEntropyLoss()
+
+    train_losses = []
+    val_accuracies = []
+    early_exit_stats = []
+    epoch_times = []
+    
+    # Track which layers are active for early exit in each iteration
+    active_layer_history = []
+    
+    step_counter = 0
+    
+    # Number of layers in the model
+    if not is_naive:
+        num_layers = len(model.layers)
+    
+    for epoch in range(epochs):
+        model.train()
+        total_loss = 0
+
+        start_time = time.time()
+        for batch_idx, (data, target) in enumerate(train_loader):
+            data, target = data.to(device), target.to(device)
+
+            optimizer.zero_grad()
+
+            # Forward pass
+            if is_naive:
+                logits = model(data)
+                loss = criterion(logits, target)
+            else:
+                # Forward pass with auxiliary logits for MoE model
+                logits, _, _, _, aux_logits = model(data, return_aux_logits=True)
+
+                # Main loss
+                main_loss = criterion(logits, target)
+
+                # Rotational curriculum - determine active layers
+                rotation_phase = (step_counter // rotation_interval) % num_layers
+                
+                # Select which layers have active early exit loss
+                # In rotational curriculum, we enable early exit loss for a subset of layers
+                # that rotates through the network over time
+                
+                # Calculate how many layers to activate in this phase (at least 1)
+                active_count = max(1, num_layers // 2)
+                
+                # Generate indices of active layers, wrapping around if needed
+                active_layers = [(rotation_phase + i) % num_layers for i in range(active_count)]
+                
+                # Record which layers are active in this step
+                if batch_idx % 50 == 0:
+                    active_layer_history.append(active_layers)
+                    print(f"Step {step_counter}, Rotation phase {rotation_phase}, Active layers: {active_layers}")
+
+                # Auxiliary losses - only apply to active layers
+                aux_loss_sum = 0
+                for idx, aux_logit in enumerate(aux_logits):
+                    if idx in active_layers:
+                        # Weight the loss based on layer depth
+                        weight = aux_loss_weight * (idx + 1) / len(aux_logits)
+                        aux_loss = weight * criterion(aux_logit, target)
+                        aux_loss_sum += aux_loss
+
+                # Total loss
+                loss = main_loss + aux_loss_sum
+
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+            step_counter += 1
+
+            if batch_idx % 50 == 0:
+                print(f'Train Epoch: {epoch} [{batch_idx * len(data)}/{len(train_loader.dataset)} '
+                      f'({100. * batch_idx / len(train_loader):.0f}%)]\tLoss: {loss.item():.6f}')
+
+        train_losses.append(total_loss / len(train_loader))
+
+        # Validation
+        model.eval()
+        correct = 0
+
+        # For non-naive models, we track early exits
+        if not is_naive:
+            layer_exits_count = [0] * (len(model.layers) + 1)  # +1 for final layer
+
+        with torch.no_grad():
+            for data, target in val_loader:
+                data, target = data.to(device), target.to(device)
+
+                # Forward pass
+                if is_naive:
+                    logits = model(data)
+                    pred = logits.argmax(dim=1, keepdim=True)
+                else:
+                    logits, layer_exits, confidences, exit_layer = model(data)
+                    # Count exits per layer
+                    layer_exits_count[exit_layer] += 1
+                    pred = logits.argmax(dim=1, keepdim=True)
+
+                correct += pred.eq(target.view_as(pred)).sum().item()
+
+        accuracy = 100. * correct / len(val_loader.dataset)
+        val_accuracies.append(accuracy)
+
+        # Calculate early exit stats if not naive model
+        if not is_naive:
+            early_exit_percentages = [count / len(val_loader.dataset) * 100 for count in layer_exits_count]
+            early_exit_stats.append(early_exit_percentages)
+            print(f'Early exits per layer: {early_exit_percentages}')
+
+        epoch_time = time.time() - start_time
+        epoch_times.append(epoch_time)
+
+        print(f'Epoch {epoch}: Train Loss: {train_losses[-1]:.4f}, '
+              f'Validation Accuracy: {accuracy:.2f}%, Time: {epoch_time:.2f}s')
+
+    # Calculate average epoch time
+    avg_epoch_time = sum(epoch_times) / len(epoch_times)
+    print(f"Average epoch time: {avg_epoch_time:.2f}s")
+
+    # Plot the active layer history to visualize the rotation
+    if not is_naive and active_layer_history:
+        plt.figure(figsize=(12, 6))
+        for step_idx, active_layers in enumerate(active_layer_history):
+            for layer in active_layers:
+                plt.scatter(step_idx, layer, c='blue', s=20)
+        plt.title('Rotational Curriculum - Active Layers Over Time')
+        plt.xlabel('Training Steps (every 50 batches)')
+        plt.ylabel('Layer Index')
+        plt.yticks(range(num_layers))
+        plt.grid(True, alpha=0.3)
+        plt.savefig('rotational_curriculum_visualization.png')
+        plt.close()
+
+    return train_losses, val_accuracies, early_exit_stats, epoch_times, avg_epoch_time, active_layer_history
+
+
+# Original training function (kept for comparison)
 def train_model(model, train_loader, val_loader, epochs=5, lr=0.001, aux_loss_weight=0.3, is_naive=False):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
@@ -313,12 +422,6 @@ def train_model(model, train_loader, val_loader, epochs=5, lr=0.001, aux_loss_we
         model.train()
         total_loss = 0
 
-        # Advance rotation if applicable
-        if hasattr(model, 'advance_rotation') and not is_naive:
-            model.advance_rotation()
-            if model.rotation_step > 0:
-                print(f"Epoch {epoch}: Rotational Curriculum - Active offset: {model.current_rotation_offset}/{model.rotation_step}")
-
         start_time = time.time()
         for batch_idx, (data, target) in enumerate(train_loader):
             data, target = data.to(device), target.to(device)
@@ -330,43 +433,21 @@ def train_model(model, train_loader, val_loader, epochs=5, lr=0.001, aux_loss_we
                 logits = model(data)
                 loss = criterion(logits, target)
             else:
-                # Forward pass now returns: final_logits, exit_layer, all_aux_logits
-                # We need all_aux_logits for the loss calculation
-                final_logits, exit_layer, all_aux_logits = model(data, return_aux_logits=True)
+                # Forward pass with auxiliary logits for MoE model
+                logits, _, _, _, aux_logits = model(data, return_aux_logits=True)
 
-                # Main loss is calculated on the final logits returned by the model.
-                # These logits correspond to the prediction made at the exit layer (or final layer)
-                # for each sample.
-                main_loss = criterion(final_logits, target)
+                # Main loss
+                main_loss = criterion(logits, target)
 
-                # Auxiliary losses - Apply Rotational Curriculum
-                # This uses the list of auxiliary logits from *all* layers
-                aux_losses = []
-                active_indices = []
-                if hasattr(model, 'rotation_step') and model.rotation_step > 0:
-                    # Rotational curriculum enabled
-                    for i in range(len(all_aux_logits)):
-                        if i % model.rotation_step == model.current_rotation_offset:
-                            # Calculate loss for the specific aux layer's output
-                            aux_losses.append(criterion(all_aux_logits[i], target))
-                            active_indices.append(i)
-                else:
-                    # Rotation disabled or not applicable - use all aux layers
-                    aux_losses = [criterion(aux_logit, target) for aux_logit in all_aux_logits]
-                    active_indices = list(range(len(all_aux_logits)))
+                # Auxiliary losses
+                aux_losses = [criterion(aux_logit, target) for aux_logit in aux_logits]
 
-                # Combine losses with weighting (apply only to active layers)
-                weighted_aux_losses = []
-                if aux_losses: # Only if there are active aux losses
-                    # Weighting uses the original layer index (from active_indices)
-                    # Normalization factor remains the total number of aux layers
-                    num_total_aux_layers = len(all_aux_logits)
-                    for idx, aux_loss in enumerate(aux_losses):
-                        original_layer_index = active_indices[idx]
-                        weight = aux_loss_weight * (original_layer_index + 1) / num_total_aux_layers
-                        weighted_aux_losses.append(weight * aux_loss)
+                # Combine losses with weighting
+                # We weight earlier layers less since they have less information
+                weighted_aux_losses = [aux_loss_weight * (idx + 1) / len(aux_losses) * loss
+                                       for idx, loss in enumerate(aux_losses)]
 
-                # Total loss is main loss + weighted sum of *active* auxiliary losses
+                # Total loss
                 loss = main_loss + sum(weighted_aux_losses)
 
             loss.backward()
@@ -397,16 +478,10 @@ def train_model(model, train_loader, val_loader, epochs=5, lr=0.001, aux_loss_we
                     logits = model(data)
                     pred = logits.argmax(dim=1, keepdim=True)
                 else:
-                    # For non-naive models, get final_logits and exit_layer
-                    final_logits, exit_layer = model(data) # No need for aux_logits here
-                    # Count exits per layer using the exit_layer tensor
-                    # Ensure exit_layer is on CPU for bincount
-                    exit_counts = torch.bincount(exit_layer.cpu(), minlength=len(model.layers) + 1)
-                    for layer_idx, count in enumerate(exit_counts):
-                        layer_exits_count[layer_idx] += count.item()
-
-                    # Get predictions from the final logits
-                    pred = final_logits.argmax(dim=1, keepdim=True)
+                    logits, layer_exits, confidences, exit_layer = model(data)
+                    # Count exits per layer
+                    layer_exits_count[exit_layer] += 1
+                    pred = logits.argmax(dim=1, keepdim=True)
 
                 correct += pred.eq(target.view_as(pred)).sum().item()
 
@@ -438,245 +513,215 @@ def evaluate_model(model, test_loader, is_naive=False):
     model = model.to(device)
     model.eval()
 
-    total_correct = 0
-    total_samples = 0
-    all_inference_times = []
-    all_exit_layers = []
+    # Regular evaluation
+    correct = 0
+
+    if not is_naive:
+        layer_exits_count = [0] * (len(model.layers) + 1)  # +1 for final layer
+        confidence_per_layer = [[] for _ in range(len(model.layers) + 1)]
+
+    # Timing
+    inference_times = []
 
     with torch.no_grad():
         for data, target in test_loader:
             data, target = data.to(device), target.to(device)
-            batch_size = data.shape[0]
-            total_samples += batch_size
 
             # Time inference
             start_time = time.time()
             if is_naive:
-                final_logits = model(data)
-                # Naive model always "exits" at the final layer
-                num_layers = len(model.layers) # Need to figure out num_layers if possible
-                # Or find a better way if NaiveClassifier doesn't store num_layers
-                # Assuming it has a .layers Sequential block
-                try:
-                   # Count Linear layers in the sequential block
-                   num_linear_layers = sum(1 for m in model.layers if isinstance(m, nn.Linear))
-                except AttributeError:
-                   num_linear_layers = 1 # Fallback
-                exit_layer = torch.full((batch_size,), num_linear_layers, dtype=torch.long, device=device)
-
+                logits = model(data)
+                inference_time = time.time() - start_time
+                inference_times.append(inference_time)
+                pred = logits.argmax(dim=1, keepdim=True)
             else:
-                # Model returns final_logits based on exit layer, and the exit layer index per sample
-                final_logits, exit_layer = model(data)
+                logits, layer_exits, confidences, exit_layer = model(data)
+                inference_time = time.time() - start_time
+                inference_times.append(inference_time)
 
-            inference_time = time.time() - start_time
-            all_inference_times.append(inference_time * batch_size) # Store total time for the batch
+                # Count exits per layer
+                layer_exits_count[exit_layer] += 1
 
-            # Get predictions from the final logits
-            pred = final_logits.argmax(dim=1)
-            total_correct += pred.eq(target).sum().item()
+                # Store confidence scores
+                for i, conf in enumerate(confidences):
+                    if i < exit_layer:
+                        confidence_per_layer[i].append(conf)
 
-            # Store exit layers for later analysis
-            all_exit_layers.append(exit_layer.cpu()) # Move to CPU immediately
+                # Get predictions
+                pred = logits.argmax(dim=1, keepdim=True)
 
-    # Consolidate results
-    accuracy = 100. * total_correct / total_samples
-    # Average inference time per sample
-    avg_inference_time_ms = (sum(all_inference_times) / total_samples) * 1000
+            correct += pred.eq(target.view_as(pred)).sum().item()
+
+    accuracy = 100. * correct / len(test_loader.dataset)
+    avg_inference_time = sum(inference_times) / len(inference_times)
 
     print(f'Test accuracy: {accuracy:.2f}%')
-    print(f'Average inference time: {avg_inference_time_ms:.2f} ms per sample')
+    print(f'Average inference time: {avg_inference_time * 1000:.2f} ms per batch')
 
-    # Calculate and print exit statistics
     if not is_naive:
-        num_layers = len(model.layers)
-        final_exit_layer_index = num_layers # Index representing the final classifier
-
-        all_exit_layers_tensor = torch.cat(all_exit_layers)
-        layer_exits_count = torch.bincount(all_exit_layers_tensor, minlength=num_layers + 1)
-
-        exit_distribution = []
-        print("Exit Distribution:")
+        # Calculate percentage of early exits per layer
+        exit_counts = []
         for i, count in enumerate(layer_exits_count):
-            layer_name = f"Layer {i}" if i < num_layers else "Final"
-            exit_pct = count.item() / total_samples * 100
-            exit_distribution.append((layer_name, exit_pct))
-            print(f'  {layer_name}: {count.item()} samples ({exit_pct:.2f}%)')
+            layer_name = f"Layer {i}" if i < len(model.layers) else "Final"
+            exit_pct = count / len(test_loader.dataset) * 100
+            exit_counts.append((layer_name, exit_pct))
+            print(f'{layer_name}: {exit_pct:.2f}% of samples')
 
-        # Check sum is 100%
-        total_pct = sum(pct for _, pct in exit_distribution)
-        print(f'  Total Percentage: {total_pct:.2f}%') # Should be 100%
+        # Calculate average confidence per layer
+        avg_confidence = []
+        for i, confidences in enumerate(confidence_per_layer):
+            if confidences:
+                layer_name = f"Layer {i}" if i < len(model.layers) else "Final"
+                avg_conf = sum(confidences) / len(confidences)
+                avg_confidence.append((layer_name, avg_conf))
+                print(f'{layer_name} average confidence: {avg_conf:.4f}')
 
         # Plot early exit distribution
         plt.figure(figsize=(10, 5))
-        labels, values = zip(*exit_distribution)
+        labels, values = zip(*exit_counts)
         plt.bar(labels, values)
-        plt.title('Exit Distribution Across Layers')
-        plt.ylabel('Percentage of Samples Exiting')
+        plt.title('Early Exit Distribution')
+        plt.ylabel('Percentage of Samples')
         plt.ylim(0, 100)
         plt.savefig('early_exit_distribution.png')
-        print("Saved exit distribution plot to early_exit_distribution.png")
 
-        return accuracy, avg_inference_time_ms, exit_distribution, None # Return None for old confidence tuple
+        # Plot average confidence per layer
+        if avg_confidence:
+            plt.figure(figsize=(10, 5))
+            labels, values = zip(*avg_confidence)
+            plt.bar(labels, values)
+            plt.title('Average Confidence per Layer')
+            plt.ylabel('Confidence Score')
+            plt.ylim(0, 1)
+            plt.savefig('confidence_per_layer.png')
 
-    # Return for naive model
-    # Need to return dummy exit info or adjust call site
-    return accuracy, avg_inference_time_ms
+        return accuracy, avg_inference_time, exit_counts, avg_confidence
+
+    return accuracy, avg_inference_time
 
 
-# Compare all models (with LayerSkip, without LayerSkip, and naive)
-def compare_model_performance():
-    # Generate synthetic data
+def compare_rotational_vs_standard():
+    """Compare rotational curriculum vs standard training approach"""
     print("Generating synthetic data...")
     train_loader, test_loader, input_dim = generate_synthetic_data(num_samples=10000, input_dim=64)
-
-    # Create models
-    model_with_skip = SimpleClassifier(
+    
+    # Hyperparameters
+    epochs = 5
+    rotation_interval = 100  # How often to rotate active layers (in batch iterations)
+    hidden_dim = 128
+    expert_count = 4
+    top_k = 2
+    num_layers = 4  # Use more layers to better observe the effect of rotation
+    confidence_thresholds = [0.6, 0.7, 0.8, 0.9]  # Increasing confidence thresholds
+    
+    # Create model with rotational curriculum
+    print("\nCreating model with rotational curriculum...")
+    model_rotational = SimpleClassifier(
         input_dim=input_dim,
+        hidden_dim=hidden_dim,
+        num_layers=num_layers,
+        expert_count=expert_count,
+        top_k=top_k,
         enable_layer_skip=True,
-        confidence_thresholds=[0.5, 0.55],  # Lowered thresholds
-        rotation_step=3
+        confidence_thresholds=confidence_thresholds
     )
-
-    model_without_skip = SimpleClassifier(
+    
+    # Create model with standard training
+    print("\nCreating model with standard training...")
+    model_standard = SimpleClassifier(
         input_dim=input_dim,
-        enable_layer_skip=False
+        hidden_dim=hidden_dim,
+        num_layers=num_layers,
+        expert_count=expert_count,
+        top_k=top_k,
+        enable_layer_skip=True,
+        confidence_thresholds=confidence_thresholds
     )
-
-    naive_model = NaiveClassifier(
-        input_dim=input_dim,
-        hidden_dim=128,
-        num_layers=2
+    
+    # Train both models
+    print("\nTraining model with rotational curriculum...")
+    train_losses_rot, val_accuracies_rot, exit_stats_rot, epoch_times_rot, avg_time_rot, active_layer_history = train_model_with_rotational_curriculum(
+        model_rotational, train_loader, test_loader, epochs=epochs, rotation_interval=rotation_interval
     )
-
-    # Train all models
-    print("Training model with LayerSkip...")
-    train_losses_skip, val_accuracies_skip, exit_stats_skip, epoch_times_skip, avg_time_skip = train_model(
-        model_with_skip, train_loader, test_loader, epochs=5
+    
+    print("\nTraining model with standard approach...")
+    train_losses_std, val_accuracies_std, exit_stats_std, epoch_times_std, avg_time_std = train_model(
+        model_standard, train_loader, test_loader, epochs=epochs
     )
-
-    print("\nTraining model without LayerSkip...")
-    train_losses_no_skip, val_accuracies_no_skip, _, epoch_times_no_skip, avg_time_no_skip = train_model(
-        model_without_skip, train_loader, test_loader, epochs=5
-    )
-
-    print("\nTraining naive model...")
-    train_losses_naive, val_accuracies_naive, _, epoch_times_naive, avg_time_naive = train_model(
-        naive_model, train_loader, test_loader, epochs=5, is_naive=True
-    )
-
-    # Evaluate all models
-    print("\nEvaluating model with LayerSkip...")
-    # Now returns: accuracy, time_ms, exit_distribution, None
-    accuracy_skip, time_skip, exits_skip, _ = evaluate_model(model_with_skip, test_loader)
-
-    print("\nEvaluating model without LayerSkip...")
-    # Now returns: accuracy, time_ms, exit_distribution, None
-    accuracy_no_skip, time_no_skip, _, _ = evaluate_model(model_without_skip, test_loader)
-
-    print("\nEvaluating naive model...")
-    # Now returns: accuracy, time_ms
-    accuracy_naive, time_naive = evaluate_model(naive_model, test_loader, is_naive=True)
-
+    
+    # Evaluate both models
+    print("\nEvaluating model with rotational curriculum...")
+    accuracy_rot, time_rot, exits_rot, conf_rot = evaluate_model(model_rotational, test_loader)
+    
+    print("\nEvaluating model with standard approach...")
+    accuracy_std, time_std, exits_std, conf_std = evaluate_model(model_standard, test_loader)
+    
     # Compare results
     print("\nComparison:")
-    # Note: time_skip, time_no_skip, time_naive are now in ms per sample
-    print(
-        f"LayerSkip: Accuracy={accuracy_skip:.2f}%, Inference time={time_skip:.2f}ms/sample, Training time/epoch={avg_time_skip:.2f}s")
-    print(
-        f"No LayerSkip: Accuracy={accuracy_no_skip:.2f}%, Inference time={time_no_skip:.2f}ms/sample, Training time/epoch={avg_time_no_skip:.2f}s")
-    print(
-        f"Naive model: Accuracy={accuracy_naive:.2f}%, Inference time={time_naive:.2f}ms/sample, Training time/epoch={avg_time_naive:.2f}s")
-
-    # Speedup comparison might need adjustment based on interpretation (per sample vs per batch)
-    if time_skip > 0:
-        print(f"Inference Speedup (LayerSkip vs. Naive, per sample): {time_naive / time_skip:.2f}x")
-    else:
-        print("Inference Speedup (LayerSkip vs. Naive): N/A (LayerSkip time is zero)")
-    if avg_time_skip > 0:
-        print(f"Training Speedup (LayerSkip vs. Naive, per epoch): {avg_time_naive / avg_time_skip:.2f}x")
-    else:
-        print("Training Speedup (LayerSkip vs. Naive): N/A (LayerSkip time is zero)")
-
+    print(f"Rotational: Accuracy={accuracy_rot:.2f}%, Inference time={time_rot * 1000:.2f}ms, Training time/epoch={avg_time_rot:.2f}s")
+    print(f"Standard: Accuracy={accuracy_std:.2f}%, Inference time={time_std * 1000:.2f}ms, Training time/epoch={avg_time_std:.2f}s")
+    
     # Plot training loss comparison
     plt.figure(figsize=(10, 5))
-    plt.plot(train_losses_skip, label='With LayerSkip')
-    plt.plot(train_losses_no_skip, label='Without LayerSkip')
-    plt.plot(train_losses_naive, label='Naive')
+    plt.plot(train_losses_rot, label='Rotational Curriculum')
+    plt.plot(train_losses_std, label='Standard Training')
     plt.title('Training Loss Comparison')
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
     plt.legend()
-    plt.savefig('training_loss_comparison.png')
-
+    plt.savefig('rot_vs_std_training_loss.png')
+    
     # Plot validation accuracy comparison
     plt.figure(figsize=(10, 5))
-    plt.plot(val_accuracies_skip, label='With LayerSkip')
-    plt.plot(val_accuracies_no_skip, label='Without LayerSkip')
-    plt.plot(val_accuracies_naive, label='Naive')
+    plt.plot(val_accuracies_rot, label='Rotational Curriculum')
+    plt.plot(val_accuracies_std, label='Standard Training')
     plt.title('Validation Accuracy Comparison')
     plt.xlabel('Epoch')
     plt.ylabel('Accuracy (%)')
     plt.legend()
-    plt.savefig('validation_accuracy_comparison.png')
-
-    # Plot training time comparison
-    plt.figure(figsize=(10, 5))
-    epochs = range(5)
-    plt.plot(epochs, epoch_times_skip, marker='o', label='With LayerSkip')
-    plt.plot(epochs, epoch_times_no_skip, marker='s', label='Without LayerSkip')
-    plt.plot(epochs, epoch_times_naive, marker='^', label='Naive')
-    plt.title('Training Time Comparison')
-    plt.xlabel('Epoch')
-    plt.ylabel('Time (seconds)')
-    plt.legend()
-    plt.grid(True)
-    plt.savefig('training_time_comparison.png')
-
-    # Bar chart for average training and inference times
+    plt.savefig('rot_vs_std_validation_accuracy.png')
+    
+    # Compare early exit distribution
     plt.figure(figsize=(12, 6))
-    models = ['LayerSkip', 'No LayerSkip', 'Naive']
-    train_times = [avg_time_skip, avg_time_no_skip, avg_time_naive]
-    # Use the per-sample inference times in ms directly
-    infer_times = [time_skip, time_no_skip, time_naive]
-
-    x = np.arange(len(models))
+    
+    # Set up bar positions
+    labels = [item[0] for item in exits_rot]
+    x = np.arange(len(labels))
     width = 0.35
-
-    fig, ax1 = plt.subplots(figsize=(12, 6))
-    ax2 = ax1.twinx()
-
-    bar1 = ax1.bar(x - width / 2, train_times, width, label='Avg. Training Time (s/epoch)', color='skyblue')
-    bar2 = ax2.bar(x + width / 2, infer_times, width, label='Avg. Inference Time (ms/sample)', color='salmon')
-
-    ax1.set_xlabel('Model Type')
-    ax1.set_ylabel('Training Time (seconds)')
-    ax2.set_ylabel('Inference Time (ms/sample)')
-
-    ax1.set_xticks(x)
-    ax1.set_xticklabels(models)
-
-    ax1.legend(loc='upper left')
-    ax2.legend(loc='upper right')
-
-    plt.title('Training vs Inference Time Comparison')
-    plt.tight_layout()
-    plt.savefig('time_comparison.png')
-
-    return model_with_skip, model_without_skip, naive_model
+    
+    # Extract values
+    values_rot = [item[1] for item in exits_rot]
+    values_std = [item[1] for item in exits_std]
+    
+    # Create grouped bar chart
+    fig, ax = plt.subplots(figsize=(12, 6))
+    rects1 = ax.bar(x - width/2, values_rot, width, label='Rotational Curriculum')
+    rects2 = ax.bar(x + width/2, values_std, width, label='Standard Training')
+    
+    ax.set_xlabel('Layer')
+    ax.set_ylabel('Percentage of Samples (%)')
+    ax.set_title('Early Exit Distribution Comparison')
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels)
+    ax.legend()
+    
+    fig.tight_layout()
+    plt.savefig('rot_vs_std_early_exit_distribution.png')
+    
+    # Save models
+    torch.save(model_rotational.state_dict(), 'model_rotational.pt')
+    torch.save(model_standard.state_dict(), 'model_standard.pt')
+    
+    return model_rotational, model_standard
 
 
 if __name__ == "__main__":
     # Set random seed for reproducibility
     torch.manual_seed(42)
     np.random.seed(42)
-
-    # Run comparison
-    print("Starting model comparison...")
-    model_with_skip, model_without_skip, naive_model = compare_model_performance()
-
-    # Save trained models
-    torch.save(model_with_skip.state_dict(), 'model_with_layerskip.pt')
-    torch.save(model_without_skip.state_dict(), 'model_without_layerskip.pt')
-    torch.save(naive_model.state_dict(), 'naive_model.pt')
-
-    print("Completed! Models saved.")
+    
+    # Run comparison of rotational vs standard approach
+    print("Starting comparison of rotational curriculum vs standard approach...")
+    model_rotational, model_standard = compare_rotational_vs_standard()
+    
+    print("\nCompleted! Models saved.")
