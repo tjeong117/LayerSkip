@@ -7,8 +7,8 @@ import numpy as np
 import time
 import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
-
-
+from datasets import load_dataset
+from sentence_transformers import SentenceTransformer
 class MoELayerWithSkip(nn.Module):
     def __init__(self, input_dim, hidden_dim, expert_count=4, top_k=2,
                  enable_layer_skip=True, confidence_threshold=0.5,
@@ -58,7 +58,8 @@ class MoELayerWithSkip(nn.Module):
             router_logits = router_logits.masked_fill(~expert_mask.unsqueeze(0), -1e10)
 
         # Get routing probabilities and indices
-        router_probs = F.softmax(router_logits, dim=-1)
+        temperature = 0.5  # Sharpens routing probabilities
+        router_probs = F.softmax(router_logits / temperature, dim=-1)
 
         # Get top-k experts
         vals, indices = torch.topk(router_probs, self.top_k, dim=-1)
@@ -204,54 +205,38 @@ class NaiveClassifier(nn.Module):
         x = self.layers(x)
         return self.classifier(x)
 
+def generate_hf_data():
+    dataset = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1")
 
-# Generate synthetic classification dataset
-def generate_synthetic_data(num_samples=10000, input_dim=64, num_classes=4):
-    """Generate synthetic data for a classification task"""
-    X = np.random.randn(num_samples, input_dim)
+    # Load a sentence embedding model
+    embedder = SentenceTransformer('all-MiniLM-L6-v2')
 
-    # Generate classes based on different regions in the feature space
-    y = np.zeros(num_samples, dtype=np.int64)
+    # Get the questions
+    questions = [entry['question'] for entry in dataset['train']]
 
-    # Class 0: Points in the first quadrant (all positive)
-    # Class 1: Points in the second quadrant (first half negative, second half positive)
-    # Class 2: Points in the third quadrant (all negative)
-    # Class 3: Points in the fourth quadrant (first half positive, second half negative)
+    # Encode questions into embeddings
+    X = embedder.encode(questions, convert_to_numpy=True)
 
-    for i in range(num_samples):
-        first_half_sum = np.sum(X[i, :input_dim // 2])
-        second_half_sum = np.sum(X[i, input_dim // 2:])
-
-        if first_half_sum > 0 and second_half_sum > 0:
-            y[i] = 0
-        elif first_half_sum < 0 and second_half_sum > 0:
-            y[i] = 1
-        elif first_half_sum < 0 and second_half_sum < 0:
-            y[i] = 2
-        else:
-            y[i] = 3
-
-    # Add some noise to make it more challenging
-    noise_indices = np.random.choice(num_samples, size=int(num_samples * 0.1), replace=False)
-    y[noise_indices] = np.random.randint(0, num_classes, size=len(noise_indices))
+    # Generate fake labels
+    y = np.random.randint(0, 4, size=len(X))
 
     # Split into train and test
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-    # Convert to tensors
     X_train_tensor = torch.FloatTensor(X_train)
     y_train_tensor = torch.LongTensor(y_train)
     X_test_tensor = torch.FloatTensor(X_test)
     y_test_tensor = torch.LongTensor(y_test)
 
-    # Create data loaders
     train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
     test_dataset = TensorDataset(X_test_tensor, y_test_tensor)
 
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=32)
 
-    return train_loader, test_loader, input_dim
+    return train_loader, test_loader, X_train.shape[1]
+
+
 
 
 # Training function with early exit loss
@@ -444,15 +429,14 @@ def evaluate_model(model, test_loader, is_naive=False):
 
 # Compare all models (with LayerSkip, without LayerSkip, and naive)
 def compare_model_performance():
-    # Generate synthetic data
-    print("Generating synthetic data...")
-    train_loader, test_loader, input_dim = generate_synthetic_data(num_samples=10000, input_dim=64)
+    # Generate HF data
+    train_loader, test_loader, input_dim = generate_hf_data()
 
     # Create models
     model_with_skip = SimpleClassifierWithExitLossGradual(
         input_dim=input_dim,
         enable_layer_skip=True,
-        confidence_thresholds=[0.7, 0.8]  # Higher thresholds for later layers
+        confidence_thresholds=[0.65, 0.75]
     )
 
     model_without_skip = SimpleClassifierWithExitLossGradual(
@@ -469,17 +453,17 @@ def compare_model_performance():
     # Train all models
     print("Training model with LayerSkip...")
     train_losses_skip, val_accuracies_skip, exit_stats_skip, epoch_times_skip, avg_time_skip = train_model(
-        model_with_skip, train_loader, test_loader, epochs=5
+        model_with_skip, train_loader, test_loader, epochs=15
     )
 
     print("\nTraining model without LayerSkip...")
     train_losses_no_skip, val_accuracies_no_skip, _, epoch_times_no_skip, avg_time_no_skip = train_model(
-        model_without_skip, train_loader, test_loader, epochs=5
+        model_without_skip, train_loader, test_loader, epochs=15
     )
 
     print("\nTraining naive model...")
     train_losses_naive, val_accuracies_naive, _, epoch_times_naive, avg_time_naive = train_model(
-        naive_model, train_loader, test_loader, epochs=5, is_naive=True
+        naive_model, train_loader, test_loader, epochs=15, is_naive=True
     )
 
     # Evaluate all models
@@ -527,7 +511,7 @@ def compare_model_performance():
 
     # Plot training time comparison
     plt.figure(figsize=(10, 5))
-    epochs = range(5)
+    epochs = range(15)
     plt.plot(epochs, epoch_times_skip, marker='o', label='With LayerSkip')
     plt.plot(epochs, epoch_times_no_skip, marker='s', label='Without LayerSkip')
     plt.plot(epochs, epoch_times_naive, marker='^', label='Naive')
@@ -576,7 +560,7 @@ if __name__ == "__main__":
     np.random.seed(42)
 
     # Run comparison
-    print("Starting model comparison...")
+    print("Starting model comparison")
     model_with_skip, model_without_skip, naive_model = compare_model_performance()
 
     # Save trained models
@@ -584,4 +568,4 @@ if __name__ == "__main__":
     torch.save(model_without_skip.state_dict(), 'model_without_layerskip_gradual_exit_loss.pt')
     torch.save(naive_model.state_dict(), 'naive_model.pt')
 
-    print("Completed! Models saved.")
+    print("Training completed and models saved")
