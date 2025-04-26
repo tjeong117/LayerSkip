@@ -1,622 +1,265 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
-import numpy as np
-import time
-import matplotlib.pyplot as plt
-from sklearn.model_selection import train_test_split
+import os, math, random, torch
+import torch.nn as nn, torch.nn.functional as F
+from torch.utils.data import DataLoader
+from dataclasses import dataclass
+from typing import List, Tuple
+import matplotlib.pyplot as plt, numpy as np
+from tqdm import tqdm
+from datasets import load_dataset
+from transformers import (GPT2TokenizerFast,
+                          TopKLogitsWarper,
+                          TopPLogitsWarper)
 
+SEQ_LEN        = 128
+BATCH_SIZE     = 8
+EPOCHS         = 3
+LR             = 5e-5
+WEIGHT_DECAY   = 0.01
+GRAD_CLIP      = 1.0
+MAX_DROP       = 0.5
+TAU_VAL        = 0.45
+LAMBDA_CONF    = 0.5
+TRAIN_LIM      = 20_000
+VAL_LIM        = 2_000
+GEN_TOP_K      = 50
+GEN_TOP_P      = 0.95
+GEN_TEMP       = 0.9
 
-class MoELayerWithSkip(nn.Module):
-    def __init__(self, input_dim, hidden_dim, expert_count=4, top_k=2,
-                 enable_layer_skip=True, confidence_threshold=0.5,
-                 expert_dropout_rate=0.2):
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+tok = GPT2TokenizerFast.from_pretrained("gpt2")
+if tok.pad_token is None:
+    tok.pad_token = tok.eos_token
+VOCAB = tok.vocab_size
+
+def keep_layer(p: float, training: bool, device):
+    return True if (not training or p == 0.0) else (torch.rand(1, device=device) > p)
+
+class TransformerBlock(nn.Module):
+    def __init__(self, d):
         super().__init__()
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        self.expert_count = expert_count
-        self.top_k = top_k
-        self.enable_layer_skip = enable_layer_skip
-        self.confidence_threshold = confidence_threshold
-        self.expert_dropout_rate = expert_dropout_rate
-        self.training_mode = True
-
-        # Router network
-        self.router = nn.Linear(input_dim, expert_count)
-
-        # Experts - simple feed-forward networks
-        self.experts = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(input_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, input_dim)
-            ) for _ in range(expert_count)
-        ])
-
-        # LayerSkip components
-        self.confidence_predictor = nn.Linear(input_dim, 1)
-        self.layer_norm = nn.LayerNorm(input_dim)
-
-    def forward(self, x, return_metrics=False):
-        # Layer normalization
-        residual = x
-        x = self.layer_norm(x)
-
-        # Get router logits
-        router_logits = self.router(x)
-
-        # Apply expert dropout during training
-        if self.training and self.expert_dropout_rate > 0:
-            expert_mask = torch.rand(self.expert_count, device=x.device) > self.expert_dropout_rate
-            # Ensure at least one expert is active
-            if not expert_mask.any():
-                expert_mask[torch.randint(0, self.expert_count, (1,))] = True
-
-            # Apply mask to router logits
-            router_logits = router_logits.masked_fill(~expert_mask.unsqueeze(0), -1e10)
-
-        # Get routing probabilities and indices
-        router_probs = F.softmax(router_logits, dim=-1)
-
-        # Get top-k experts
-        vals, indices = torch.topk(router_probs, self.top_k, dim=-1)
-
-        # Normalize the router probabilities
-        vals = vals / vals.sum(dim=-1, keepdim=True)
-
-        # Compute early exit confidence if enabled
-        early_exit = False
-        confidence_score = 0.0
-
-        if self.enable_layer_skip and not self.training:
-            confidence = torch.sigmoid(self.confidence_predictor(x))
-            confidence_score = confidence.mean().item()
-
-            # Check if we should exit early
-            if confidence_score > self.confidence_threshold:
-                early_exit = True
-                # Just return the input if we exit early
-                if return_metrics:
-                    return residual + x, early_exit, vals, indices, router_probs, confidence_score
-                return residual + x, early_exit, confidence_score
-
-        # Process through experts
-        batch_size = x.shape[0]
-
-        # Initialize output tensor
-        combined_output = torch.zeros_like(x)
-
-        # Simple MoE computation
-        for b in range(batch_size):
-            for k in range(self.top_k):
-                expert_idx = indices[b, k].item()
-                weight = vals[b, k].item()
-                expert_output = self.experts[expert_idx](x[b].unsqueeze(0))
-                combined_output[b] += weight * expert_output.squeeze(0)
-
-        # Residual connection
-        output = residual + combined_output
-
-        if return_metrics:
-            return output, early_exit, vals, indices, router_probs, confidence_score
-        return output, early_exit, confidence_score
-
-
-
-def layer_dropout_schedule(epoch, total_epochs, max_drop_prob=0.5):
-    """
-    Returns dropout probability for the current epoch.
-    Starts high (max_drop_prob) and decays linearly to 0.
-    """
-    return max_drop_prob * (1 - epoch / total_epochs)
-
-def visualize_layer_dropout_schedule(total_epochs, max_drop_prob=0.5):
-    import matplotlib.pyplot as plt
-    probs = [layer_dropout_schedule(e, total_epochs, max_drop_prob) for e in range(total_epochs)]
-    plt.figure(figsize=(8, 4))
-    plt.plot(range(total_epochs), probs, marker='o')
-    plt.title("Layer Dropout Probability Schedule")
-    plt.xlabel("Epoch")
-    plt.ylabel("Dropout Probability")
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig("layer_dropout_schedule.png")
-    print("Saved layer_dropout_schedule.png")
-
-
-
-# Modify the SimpleClassifier to include dropout curriculum
-
-class SimpleClassifier(nn.Module):
-    def __init__(self, input_dim=64, hidden_dim=128, num_layers=2,
-                 num_classes=4, expert_count=4, top_k=2, enable_layer_skip=True,
-                 confidence_thresholds=None):
-        super().__init__()
-
-        self.input_layer = nn.Linear(input_dim, hidden_dim)
-        self.enable_layer_skip = enable_layer_skip
-        self.curr_epoch = 0
-        self.total_epochs = 1  # Will be updated from training loop
-
-        if confidence_thresholds is None:
-            confidence_thresholds = [0.5] * num_layers
-
-        self.layers = nn.ModuleList([
-            MoELayerWithSkip(
-                input_dim=hidden_dim,
-                hidden_dim=hidden_dim * 2,
-                expert_count=expert_count,
-                top_k=top_k,
-                enable_layer_skip=enable_layer_skip,
-                confidence_threshold=confidence_thresholds[i]
-            ) for i in range(num_layers)
-        ])
-
-        self.aux_classifiers = nn.ModuleList([
-            nn.Linear(hidden_dim, num_classes) for _ in range(num_layers)
-        ])
-
-        self.classifier = nn.Linear(hidden_dim, num_classes)
-
-    def train(self, mode=True):
-        super().train(mode)
-        for layer in self.layers:
-            layer.training_mode = mode
-        return self
-
-    def eval(self):
-        super().eval()
-        for layer in self.layers:
-            layer.training_mode = False
-        return self
-
-    def forward(self, x, return_aux_logits=False):
-        x = F.relu(self.input_layer(x))
-
-        aux_logits = []
-        layer_exits = []
-        confidence_scores = []
-
-        for i, (layer, aux_cls) in enumerate(zip(self.layers, self.aux_classifiers)):
-            # Apply layer dropout curriculum during training
-            if self.training:
-                dropout_prob = layer_dropout_schedule(self.curr_epoch, self.total_epochs)
-                if torch.rand(1).item() < dropout_prob:
-                    continue  # Skip this layer
-
-            x, early_exit, conf = layer(x)
-            layer_exits.append(early_exit)
-            confidence_scores.append(conf)
-            aux_logits.append(aux_cls(x))
-
-            if early_exit and self.enable_layer_skip and not self.training:
-                if return_aux_logits:
-                    return aux_logits[i], layer_exits, confidence_scores, i
-                return aux_logits[i], layer_exits, confidence_scores, i
-
-        logits = self.classifier(x)
-
-        if return_aux_logits:
-            return logits, layer_exits, confidence_scores, len(self.layers), aux_logits
-        return logits, layer_exits, confidence_scores, len(self.layers)
-
-
-
-# Naive model for comparison
-class NaiveClassifier(nn.Module):
-    def __init__(self, input_dim=64, hidden_dim=128, num_layers=2, num_classes=4):
-        super().__init__()
-
-        self.input_layer = nn.Linear(input_dim, hidden_dim)
-
-        # Create layers without MoE or LayerSkip - simple feed-forward
-        layers = []
-        for _ in range(num_layers):
-            layers.append(nn.Linear(hidden_dim, hidden_dim))
-            layers.append(nn.ReLU())
-
-        self.layers = nn.Sequential(*layers)
-        self.classifier = nn.Linear(hidden_dim, num_classes)
+        self.attn = nn.MultiheadAttention(d, 8, batch_first=True)
+        self.mlp  = nn.Sequential(nn.Linear(d, 4*d), nn.GELU(), nn.Linear(4*d, d))
+        self.ln1, self.ln2 = nn.LayerNorm(d), nn.LayerNorm(d)
 
     def forward(self, x):
-        x = F.relu(self.input_layer(x))
-        x = self.layers(x)
-        return self.classifier(x)
+        h, _ = self.attn(x, x, x)
+        x = self.ln1(x + h)
+        return self.ln2(x + self.mlp(x))
 
+class MoE(nn.Module):
+    def __init__(self, d, hidden, n_exp=4, k=2):
+        super().__init__()
+        self.k = k
+        self.router = nn.Linear(d, n_exp)
+        self.experts = nn.ModuleList([nn.Sequential(nn.Linear(d, hidden), nn.GELU(), nn.Linear(hidden, d)) for _ in range(n_exp)])
 
-# Generate synthetic classification dataset
-def generate_synthetic_data(num_samples=10000, input_dim=64, num_classes=4):
-    """Generate synthetic data for a classification task"""
-    X = np.random.randn(num_samples, input_dim)
+    def forward(self, x):
+        B, T, D = x.shape
+        scores = self.router(x)
+        top_s, top_i = scores.topk(self.k, dim=-1)
+        probs = F.softmax(top_s, dim=-1)
+        all_out = torch.stack([e(x) for e in self.experts], dim=2)
+        gathered = torch.gather(all_out, 2, top_i.unsqueeze(-1).expand(-1, -1, -1, D))
+        return (probs.unsqueeze(-1) * gathered).sum(dim=2)
 
-    # Generate classes based on different regions in the feature space
-    y = np.zeros(num_samples, dtype=np.int64)
+class MoEBlock(nn.Module):
+    def __init__(self, d, hidden, n_exp=4, k=2):
+        super().__init__()
+        self.tr = TransformerBlock(d)
+        self.moe = MoE(d, hidden, n_exp, k)
+        self.ln = nn.LayerNorm(d)
 
-    # Class 0: Points in the first quadrant (all positive)
-    # Class 1: Points in the second quadrant (first half negative, second half positive)
-    # Class 2: Points in the third quadrant (all negative)
-    # Class 3: Points in the fourth quadrant (first half positive, second half negative)
+    def forward(self, x):
+        return self.ln(self.moe(self.tr(x)))
 
-    for i in range(num_samples):
-        first_half_sum = np.sum(X[i, :input_dim // 2])
-        second_half_sum = np.sum(X[i, input_dim // 2:])
+@dataclass
+class LayerSpec:
+    module: nn.Module
+    drop: float
 
-        if first_half_sum > 0 and second_half_sum > 0:
-            y[i] = 0
-        elif first_half_sum < 0 and second_half_sum > 0:
-            y[i] = 1
-        elif first_half_sum < 0 and second_half_sum < 0:
-            y[i] = 2
-        else:
-            y[i] = 3
+class MoETextGen(nn.Module):
+    def __init__(self, vocab, d=512, L=12, n_exp=4, k=2, max_drop=MAX_DROP):
+        super().__init__()
+        self.token = nn.Embedding(vocab, d)
+        self.pos   = nn.Embedding(1024, d)
 
-    # Add some noise to make it more challenging
-    noise_indices = np.random.choice(num_samples, size=int(num_samples * 0.1), replace=False)
-    y[noise_indices] = np.random.randint(0, num_classes, size=len(noise_indices))
+        # gradual dropout probabilities
+        specs: List[LayerSpec] = []
+        for i in range(L):
+            p = max(0, (i - 3) / (L - 4)) * max_drop
+            specs.append(LayerSpec(MoEBlock(d, 4*d, n_exp, k), p))
 
-    # Split into train and test
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        self.blocks = nn.ModuleList([s.module for s in specs])
+        self.p_drop = [s.drop for s in specs]
 
-    # Convert to tensors
-    X_train_tensor = torch.FloatTensor(X_train)
-    y_train_tensor = torch.LongTensor(y_train)
-    X_test_tensor = torch.FloatTensor(X_test)
-    y_test_tensor = torch.LongTensor(y_test)
+        self.ln_f = nn.LayerNorm(d)
+        self.head = nn.Linear(d, vocab, bias=False)    # shared head
 
-    # Create data loaders
-    train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
-    test_dataset = TensorDataset(X_test_tensor, y_test_tensor)
+    def forward(self, idx, training=False, collect_exit_layers=False, tau=TAU_VAL):
+        B, T = idx.shape
+        h = self.token(idx) + self.pos(torch.arange(T, device=idx.device).unsqueeze(0))
 
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=32)
+        logits_layers = []
+        exit_layer_tensor = None
 
-    return train_loader, test_loader, input_dim
+        for i, (blk, p) in enumerate(zip(self.blocks, self.p_drop)):
+            if keep_layer(p, self.training, idx.device):          # LayerSkip drop
+                h = blk(h)
 
+            # shared exit head
+            logits = self.head(self.ln_f(h))
+            logits_layers.append(logits)
 
-# Training function with early exit loss
-def train_model(model, train_loader, val_loader, epochs=5, lr=0.001, aux_loss_weight=0.3, is_naive=False):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
+            # early exit
+            if not self.training and collect_exit_layers:
+                conf = logits[:, -1, :].softmax(-1).max(-1).values  # max-prob of next token
+                if exit_layer_tensor is None:
+                    exit_layer_tensor = torch.full((B,), len(self.blocks) - 1, device=idx.device)
+                mask = (conf > tau) & (exit_layer_tensor == len(self.blocks) - 1)
+                exit_layer_tensor = torch.where(mask,torch.full_like(exit_layer_tensor, i),exit_layer_tensor)
+        return logits_layers, exit_layer_tensor
 
-    model = model.to(device)
-    model.total_epochs = epochs 
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.CrossEntropyLoss()
+# data
+def get_loaders():
+    ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
 
-    train_losses = []
-    val_accuracies = []
-    early_exit_stats = []
-    epoch_times = []  # Record time per epoch
+    def enc(b):
+        ids = tok(b["text"], truncation=True, padding="max_length",
+                  max_length=SEQ_LEN + 1, return_tensors="pt").input_ids
+        return {"input_ids": ids[:, :-1], "labels": ids[:, 1:]}
 
-    for epoch in range(epochs):
-        model.curr_epoch = epoch 
-        model.train()
-        total_loss = 0
+    ds = ds.map(enc, batched=True, remove_columns=["text"])
+    ds.set_format(type="torch")
+    tr = ds.shuffle(seed=42).select(range(TRAIN_LIM))
+    va = ds.select(range(VAL_LIM))
+    return (DataLoader(tr, batch_size=BATCH_SIZE, shuffle=True),
+            DataLoader(va, batch_size=BATCH_SIZE))
 
-        start_time = time.time()
-        for batch_idx, (data, target) in enumerate(train_loader):
-            data, target = data.to(device), target.to(device)
+train_loader, val_loader = get_loaders()
 
-            optimizer.zero_grad()
+# defining models
+model = MoETextGen(VOCAB).to(device)
+opt   = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, len(train_loader) * EPOCHS)
+CE, BCE = nn.CrossEntropyLoss(), nn.BCELoss()
 
-            # Forward pass
-            if is_naive:
-                logits = model(data)
-                loss = criterion(logits, target)
-            else:
-                # Forward pass with auxiliary logits for MoE model
-                logits, _, _, _, aux_logits = model(data, return_aux_logits=True)
-
-                # Main loss
-                main_loss = criterion(logits, target)
-
-                # Auxiliary losses
-                aux_losses = [criterion(aux_logit, target) for aux_logit in aux_logits]
-
-                # Combine losses with weighting
-                # We weight earlier layers less since they have less information
-                weighted_aux_losses = [aux_loss_weight * (idx + 1) / len(aux_losses) * loss
-                                       for idx, loss in enumerate(aux_losses)]
-
-                # Total loss
-                loss = main_loss + sum(weighted_aux_losses)
-
-            loss.backward()
-            optimizer.step()
-
-            total_loss += loss.item()
-
-            if batch_idx % 50 == 0:
-                print(f'Train Epoch: {epoch} [{batch_idx * len(data)}/{len(train_loader.dataset)} '
-                      f'({100. * batch_idx / len(train_loader):.0f}%)]\tLoss: {loss.item():.6f}')
-
-        train_losses.append(total_loss / len(train_loader))
-
-        # Validation
-        model.eval()
-        correct = 0
-
-        # For non-naive models, we track early exits
-        if not is_naive:
-            layer_exits_count = [0] * (len(model.layers) + 1)  # +1 for final layer
-
-        with torch.no_grad():
-            for data, target in val_loader:
-                data, target = data.to(device), target.to(device)
-
-                # Forward pass
-                if is_naive:
-                    logits = model(data)
-                    pred = logits.argmax(dim=1, keepdim=True)
-                else:
-                    logits, layer_exits, confidences, exit_layer = model(data)
-                    # Count exits per layer
-                    layer_exits_count[exit_layer] += 1
-                    pred = logits.argmax(dim=1, keepdim=True)
-
-                correct += pred.eq(target.view_as(pred)).sum().item()
-
-        accuracy = 100. * correct / len(val_loader.dataset)
-        val_accuracies.append(accuracy)
-
-        # Calculate early exit stats if not naive model
-        if not is_naive:
-            early_exit_percentages = [count / len(val_loader.dataset) * 100 for count in layer_exits_count]
-            early_exit_stats.append(early_exit_percentages)
-            print(f'Early exits per layer: {early_exit_percentages}')
-
-        epoch_time = time.time() - start_time
-        epoch_times.append(epoch_time)
-
-        print(f'Epoch {epoch}: Train Loss: {train_losses[-1]:.4f}, '
-              f'Validation Accuracy: {accuracy:.2f}%, Time: {epoch_time:.2f}s')
-
-    # Calculate average epoch time
-    avg_epoch_time = sum(epoch_times) / len(epoch_times)
-    print(f"Average epoch time: {avg_epoch_time:.2f}s")
-
-    return train_losses, val_accuracies, early_exit_stats, epoch_times, avg_epoch_time
-
-
-# Function to evaluate and visualize results
-def evaluate_model(model, test_loader, is_naive=False):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = model.to(device)
+# samples text
+warpers = [TopKLogitsWarper(GEN_TOP_K), TopPLogitsWarper(GEN_TOP_P)]
+def sample_text(prompt="In a distant future, humanity has learned to", max_new=60):
     model.eval()
-
-    # Regular evaluation
-    correct = 0
-
-    if not is_naive:
-        layer_exits_count = [0] * (len(model.layers) + 1)  # +1 for final layer
-        confidence_per_layer = [[] for _ in range(len(model.layers) + 1)]
-
-    # Timing
-    inference_times = []
-
+    ids = tok(prompt, return_tensors="pt").input_ids.to(device)
     with torch.no_grad():
-        for data, target in test_loader:
-            data, target = data.to(device), target.to(device)
+        for _ in range(max_new):
+            logits, _ = model(ids, collect_exit_layers=False, tau=TAU_VAL)
+            logits = logits[-1][:, -1, :] / GEN_TEMP
+            for w in warpers:
+                logits = w(None, logits)
+            probs = logits.softmax(-1)
+            nxt = torch.multinomial(probs, 1).squeeze(-1)
+            if nxt.item() == tok.eos_token_id:
+                break
+            ids = torch.cat([ids, nxt.unsqueeze(0)], dim=1)
+    return tok.decode(ids[0], skip_special_tokens=True)
 
-            # Time inference
-            start_time = time.time()
-            if is_naive:
-                logits = model(data)
-                inference_time = time.time() - start_time
-                inference_times.append(inference_time)
-                pred = logits.argmax(dim=1, keepdim=True)
-            else:
-                logits, layer_exits, confidences, exit_layer = model(data)
-                inference_time = time.time() - start_time
-                inference_times.append(inference_time)
+# train loss, validation loss, perplexity, accuracy, average exit layer
+stats = {k: [] for k in ["tr", "vl", "ppl", "acc", "exit"]}
 
-                # Count exits per layer
-                layer_exits_count[exit_layer] += 1
+# training
+for ep in range(1, EPOCHS + 1):
+    model.train()
+    tot_loss = 0
+    n_tok = 0
+    for b in tqdm(train_loader, desc=f"Train {ep}/{EPOCHS}"):
+        opt.zero_grad()
+        inp, lab = b["input_ids"].to(device), b["labels"].to(device)
+        outs, _ = model(inp, training=True)
 
-                # Store confidence scores
-                for i, conf in enumerate(confidences):
-                    if i < exit_layer:
-                        confidence_per_layer[i].append(conf)
+        # layerskip loss
+        loss_main = loss_conf = 0.0
+        for log in outs:
+            sl, sb = log[:, :-1, :], lab[:, :-1]
+            loss_main += CE(sl.reshape(-1, VOCAB), sb.reshape(-1))
 
-                # Get predictions
-                pred = logits.argmax(dim=1, keepdim=True)
+            probs = sl.softmax(-1).max(-1).values
+            correct = (sl.argmax(-1) == sb).float()
+            loss_conf += BCE(probs.view(-1), correct.view(-1))
 
-            correct += pred.eq(target.view_as(pred)).sum().item()
+        loss = (loss_main + LAMBDA_CONF * loss_conf) / len(outs)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+        opt.step()
+        sched.step()
 
-    accuracy = 100. * correct / len(test_loader.dataset)
-    avg_inference_time = sum(inference_times) / len(inference_times)
+        tot_loss += loss.item() * inp.numel()
+        n_tok    += inp.numel()
+    stats["tr"].append(tot_loss / n_tok)
 
-    print(f'Test accuracy: {accuracy:.2f}%')
-    print(f'Average inference time: {avg_inference_time * 1000:.2f} ms per batch')
+    # validate model
+    model.eval()
+    vl = vt = cor = ex_sum = ex_tok = 0
+    with torch.no_grad():
+        for b in tqdm(val_loader, desc=f"Val   {ep}/{EPOCHS}"):
+            inp, lab = b["input_ids"].to(device), b["labels"].to(device)
+            outs, ex = model(inp, collect_exit_layers=True, tau=TAU_VAL)
 
-    if not is_naive:
-        # Calculate percentage of early exits per layer
-        exit_counts = []
-        for i, count in enumerate(layer_exits_count):
-            layer_name = f"Layer {i}" if i < len(model.layers) else "Final"
-            exit_pct = count / len(test_loader.dataset) * 100
-            exit_counts.append((layer_name, exit_pct))
-            print(f'{layer_name}: {exit_pct:.2f}% of samples')
+            log = outs[-1]
+            sl, sb = log[:, :-1, :], lab[:, :-1]
+            vl += CE(sl.reshape(-1, VOCAB), sb.reshape(-1)).item() * sb.numel()
+            vt += sb.numel()
+            cor += (sl.argmax(-1) == sb).float().sum().item()
 
-        # Calculate average confidence per layer
-        avg_confidence = []
-        for i, confidences in enumerate(confidence_per_layer):
-            if confidences:
-                layer_name = f"Layer {i}" if i < len(model.layers) else "Final"
-                avg_conf = sum(confidences) / len(confidences)
-                avg_confidence.append((layer_name, avg_conf))
-                print(f'{layer_name} average confidence: {avg_conf:.4f}')
+            # get stats for layerskip
+            if ex is not None:
+                seq_len = (inp != tok.pad_token_id).sum(-1)
+                ex_sum += (ex * seq_len).sum().item()   # sum of exit_layer * token_count
+                ex_tok += seq_len.sum().item()
 
-        # Plot early exit distribution
-        plt.figure(figsize=(10, 5))
-        labels, values = zip(*exit_counts)
-        plt.bar(labels, values)
-        plt.title('Early Exit Distribution')
-        plt.ylabel('Percentage of Samples')
-        plt.ylim(0, 100)
-        plt.savefig('early_exit_distribution.png')
+    stats["vl"].append(vl / vt)
+    stats["ppl"].append(math.exp(vl / vt))
+    stats["acc"].append(cor / vt)
+    stats["exit"].append(ex_sum / ex_tok if ex_tok else len(model.blocks))
 
-        # Plot average confidence per layer
-        if avg_confidence:
-            plt.figure(figsize=(10, 5))
-            labels, values = zip(*avg_confidence)
-            plt.bar(labels, values)
-            plt.title('Average Confidence per Layer')
-            plt.ylabel('Confidence Score')
-            plt.ylim(0, 1)
-            plt.savefig('confidence_per_layer.png')
+    print(f"\nEpoch {ep}: "
+          f"Train={stats['tr'][-1]:.4f}  Val={stats['vl'][-1]:.4f}  "
+          f"PPL={stats['ppl'][-1]:.2f}  Acc={stats['acc'][-1]*100:.1f}%  "
+          f"Exit/tok={stats['exit'][-1]:.2f}\n")
 
-        return accuracy, avg_inference_time, exit_counts, avg_confidence
+    print("Sample:\n", sample_text(), "\n" + "-" * 80)
 
-    return accuracy, avg_inference_time
+# results
+plt.figure(figsize=(14, 4))
+plt.subplot(131)
+plt.plot(stats['tr'], label='train')
+plt.plot(stats['vl'], label='val')
+plt.title("loss"); plt.legend()
 
+plt.subplot(132)
+plt.plot(stats['ppl'])
+plt.title("val PPL")
 
-# Compare all models (with LayerSkip, without LayerSkip, and naive)
-def compare_model_performance():
-    # Generate synthetic data
-    print("Generating synthetic data...")
-    train_loader, test_loader, input_dim = generate_synthetic_data(num_samples=10000, input_dim=64)
+plt.subplot(133)
+plt.plot(stats['exit'])
+plt.title("avg exit / token")
 
-    # Create models
-    model_with_skip = SimpleClassifier(
-        input_dim=input_dim,
-        enable_layer_skip=True,
-        confidence_thresholds=[0.7, 0.8]  # Higher thresholds for later layers
-    )
-
-    model_without_skip = SimpleClassifier(
-        input_dim=input_dim,
-        enable_layer_skip=False
-    )
-
-    naive_model = NaiveClassifier(
-        input_dim=input_dim,
-        hidden_dim=128,
-        num_layers=2
-    )
-
-    # Train all models
-    print("Training model with LayerSkip...")
-    train_losses_skip, val_accuracies_skip, exit_stats_skip, epoch_times_skip, avg_time_skip = train_model(
-        model_with_skip, train_loader, test_loader, epochs=5
-    )
-
-    print("\nTraining model without LayerSkip...")
-    train_losses_no_skip, val_accuracies_no_skip, _, epoch_times_no_skip, avg_time_no_skip = train_model(
-        model_without_skip, train_loader, test_loader, epochs=5
-    )
-
-    print("\nTraining naive model...")
-    train_losses_naive, val_accuracies_naive, _, epoch_times_naive, avg_time_naive = train_model(
-        naive_model, train_loader, test_loader, epochs=5, is_naive=True
-    )
-
-    # Evaluate all models
-    print("\nEvaluating model with LayerSkip...")
-    accuracy_skip, time_skip, exits_skip, _ = evaluate_model(model_with_skip, test_loader)
-
-    print("\nEvaluating model without LayerSkip...")
-    accuracy_no_skip, time_no_skip, _, _ = evaluate_model(model_without_skip, test_loader)
-
-    print("\nEvaluating naive model...")
-    accuracy_naive, time_naive = evaluate_model(naive_model, test_loader, is_naive=True)
-
-    # Compare results
-    print("\nComparison:")
-    print(
-        f"LayerSkip: Accuracy={accuracy_skip:.2f}%, Inference time={time_skip * 1000:.2f}ms, Training time/epoch={avg_time_skip:.2f}s")
-    print(
-        f"No LayerSkip: Accuracy={accuracy_no_skip:.2f}%, Inference time={time_no_skip * 1000:.2f}ms, Training time/epoch={avg_time_no_skip:.2f}s")
-    print(
-        f"Naive model: Accuracy={accuracy_naive:.2f}%, Inference time={time_naive * 1000:.2f}ms, Training time/epoch={avg_time_naive:.2f}s")
-    print(f"Inference Speedup vs. Naive: {time_naive / time_skip:.2f}x")
-    print(f"Training Speedup vs. Naive: {avg_time_naive / avg_time_skip:.2f}x")
-
-    # Plot training loss comparison
-    plt.figure(figsize=(10, 5))
-    plt.plot(train_losses_skip, label='With LayerSkip')
-    plt.plot(train_losses_no_skip, label='Without LayerSkip')
-    plt.plot(train_losses_naive, label='Naive')
-    plt.title('Training Loss Comparison')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.legend()
-    plt.savefig('training_loss_comparison.png')
-
-    # Plot validation accuracy comparison
-    plt.figure(figsize=(10, 5))
-    plt.plot(val_accuracies_skip, label='With LayerSkip')
-    plt.plot(val_accuracies_no_skip, label='Without LayerSkip')
-    plt.plot(val_accuracies_naive, label='Naive')
-    plt.title('Validation Accuracy Comparison')
-    plt.xlabel('Epoch')
-    plt.ylabel('Accuracy (%)')
-    plt.legend()
-    plt.savefig('validation_accuracy_comparison.png')
-
-    # Plot training time comparison
-    plt.figure(figsize=(10, 5))
-    epochs = range(5)
-    plt.plot(epochs, epoch_times_skip, marker='o', label='With LayerSkip')
-    plt.plot(epochs, epoch_times_no_skip, marker='s', label='Without LayerSkip')
-    plt.plot(epochs, epoch_times_naive, marker='^', label='Naive')
-    plt.title('Training Time Comparison')
-    plt.xlabel('Epoch')
-    plt.ylabel('Time (seconds)')
-    plt.legend()
-    plt.grid(True)
-    plt.savefig('training_time_comparison.png')
-
-    # Bar chart for average training and inference times
-    plt.figure(figsize=(12, 6))
-    models = ['LayerSkip', 'No LayerSkip', 'Naive']
-    train_times = [avg_time_skip, avg_time_no_skip, avg_time_naive]
-    infer_times = [time_skip * 1000, time_no_skip * 1000, time_naive * 1000]  # Convert to ms
-
-    x = np.arange(len(models))
-    width = 0.35
-
-    fig, ax1 = plt.subplots(figsize=(12, 6))
-    ax2 = ax1.twinx()
-
-    bar1 = ax1.bar(x - width / 2, train_times, width, label='Avg. Training Time (s/epoch)', color='skyblue')
-    bar2 = ax2.bar(x + width / 2, infer_times, width, label='Avg. Inference Time (ms/batch)', color='salmon')
-
-    ax1.set_xlabel('Model Type')
-    ax1.set_ylabel('Training Time (seconds)')
-    ax2.set_ylabel('Inference Time (milliseconds)')
-
-    ax1.set_xticks(x)
-    ax1.set_xticklabels(models)
-
-    ax1.legend(loc='upper left')
-    ax2.legend(loc='upper right')
-
-    plt.title('Training vs Inference Time Comparison')
-    plt.tight_layout()
-    plt.savefig('time_comparison.png')
-
-    return model_with_skip, model_without_skip, naive_model
+plt.tight_layout()
+plt.show()
 
 
-if __name__ == "__main__":
-    # Set random seed for reproducibility
-    torch.manual_seed(42)
-    np.random.seed(42)
+# def trace_generation(prompt, max_new=7, tau=TAU_VAL):
+#     model.eval()
+#     ids = tok(prompt, return_tensors="pt").input_ids.to(device)
+#     for step in range(max_new):
+#         logits_layers, ex = model(ids, collect_exit_layers=True, tau=tau)
+#         deepest = int(ex.item())
+#         confs = [l[:, -1, :].softmax(-1).max().item() for l in logits_layers]
+#         print(f"\nSTEP {step}  (exit @ layer {deepest})")
+#         print(" ".join(f"{c:.2f}" for c in confs))
+#         next_token = torch.multinomial(
+#             logits_layers[deepest][:, -1, :].softmax(-1), 1
+#         )
+#         if next_token.item() == tok.eos_token_id:
+#             break
+#         ids = torch.cat([ids, next_token], dim=1)
+#     print("\nFINAL TEXT:\n", tok.decode(ids[0], skip_special_tokens=True))
 
-    # Run comparison
-     # Visualize the layer dropout curriculum schedule before training
-    visualize_layer_dropout_schedule(total_epochs=5)
-
-    # Run model training and evaluation
-    print("Starting model comparison...")
-    model_with_skip, model_without_skip, naive_model = compare_model_performance()
-
-    # Save trained models
-    torch.save(model_with_skip.state_dict(), 'model_with_layerskip_curriculum.pt')
-    torch.save(model_without_skip.state_dict(), 'model_without_layerskip.pt')
-    torch.save(naive_model.state_dict(), 'naive_model.pt')
-
-    print("Completed! Models with Layer Dropout Curriculum saved.")
+# trace_generation("My favorite type of car is a")
